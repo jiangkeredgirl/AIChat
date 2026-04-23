@@ -1,5 +1,6 @@
 import os
 import json
+import datetime
 import requests
 
 DEEPSEEK_API_KEY = "sk-892f8f3341d34354b8d245ade13d9269"
@@ -60,7 +61,8 @@ def main():
     print("输入 'history' 查看历史记录")
     print("=" * 50)
 
-    system_prompt = "你是一个智能助手，请用用户相同的语言回答问题。回答要简短精炼，不超过3句话。"
+    now = datetime.datetime.now().strftime("%Y年%m月%d日 %H:%M:%S")
+    system_prompt = f"你是一个智能助手，当前时间是 {now}，请用用户相同的语言回答问题。回答要简短精炼，不超过3句话。"
     conversation_history = [{"role": "system", "content": system_prompt}]
 
     while True:
