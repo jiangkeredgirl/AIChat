@@ -4,7 +4,7 @@ import requests
 
 DEEPSEEK_API_KEY = "sk-892f8f3341d34354b8d245ade13d9269"
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
-DEEPSEEK_MODEL   = "deepseek-chat"
+DEEPSEEK_MODEL   = "deepseek-reasoner"
 
 
 def chat(conversation_history, user_input):
@@ -38,7 +38,8 @@ def chat(conversation_history, user_input):
             break
         try:
             chunk = json.loads(text)
-            content = chunk["choices"][0].get("delta", {}).get("content", "")
+            delta = chunk["choices"][0].get("delta", {})
+            content = delta.get("content", "")
             if content:
                 print(content, end="", flush=True)
                 full_reply += content
@@ -59,7 +60,7 @@ def main():
     print("输入 'history' 查看历史记录")
     print("=" * 50)
 
-    system_prompt = "你是一个智能助手，请用用户相同的语言回答问题。"
+    system_prompt = "你是一个智能助手，请用用户相同的语言回答问题。回答要简短精炼，不超过3句话。"
     conversation_history = [{"role": "system", "content": system_prompt}]
 
     while True:
