@@ -1,4 +1,15 @@
 import os
+import sys
+import io
+
+# ── Windows 控制台强制使用 UTF-8 编码（解决中文乱码）────────────────────
+if sys.platform == "win32":
+    import os
+    os.system("chcp 65001 >nul 2>&1")   # 控制台代码页切换到 UTF-8
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    sys.stdin  = io.TextIOWrapper(sys.stdin.buffer,  encoding="utf-8", errors="replace")
+
 import json
 import datetime
 import requests
@@ -8,8 +19,77 @@ try:
     import speech_recognition as sr
     import pyaudio as _pyaudio
 
+    def _registry_chinese_names() -> list:
+        """从注册表收集所有捕获端点的中文友好名称（REG_SZ 原生 Unicode，无编码问题）"""
+        import winreg
+        REG_PATH = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture"
+        FRIENDLY  = "{a45c254e-df1c-4efd-8020-67d146a850e0},2"
+        seen, names = set(), []
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, REG_PATH) as base:
+                i = 0
+                while True:
+                    try:
+                        guid = winreg.EnumKey(base, i)
+                        i += 1
+                    except OSError:
+                        break
+                    try:
+                        with winreg.OpenKey(base, guid + r"\Properties") as props:
+                            v, _ = winreg.QueryValueEx(props, FRIENDLY)
+                            # 只保留含中文字符的名称
+                            if any("\u4e00" <= c <= "\u9fff" for c in v) and v not in seen:
+                                seen.add(v)
+                                names.append(v)
+                    except (FileNotFoundError, OSError):
+                        pass
+        except Exception:
+            pass
+        return names
+
+    def _repair_device_name(pa_name: str, cn_reg: list) -> str:
+        """修复 PyAudio 设备名中的乱码中文前缀。
+        格式：{中文前缀} ({英文设备类型})
+        策略：
+          1. 前缀已在注册表中文名列表中 → 无需修复
+          2. 否则用英文后缀关键词在注册表中文名里查找替代
+        """
+        import re
+        m = re.match(r'^(.*?)\s*(\([^)]+\))\s*$', pa_name)
+        if not m:
+            return pa_name
+        prefix = m.group(1).strip()
+        paren  = m.group(2)            # e.g. "(Realtek HD Audio Line input)"
+        paren_lower = paren.lower()
+
+        # 前缀已正确，直接返回
+        if prefix in cn_reg:
+            return pa_name
+
+        # 英文类型关键词 → 对应中文名中应包含的子串
+        KEYWORD_MAP = [
+            (["microphone", "mic"],              ["麦克风", "话筒"]),
+            (["line input", "line in", "line"],  ["线路输入", "线路"]),
+            (["stereo mix", "stereo"],           ["立体声混音", "立体声"]),
+            (["headphone", "headset"],           ["耳机"]),
+            (["speaker"],                        ["扬声器"]),
+            (["front"],                          ["前置"]),
+            (["rear"],                           ["后置"]),
+            (["center"],                         ["中置"]),
+            (["subwoofer"],                      ["低音"]),
+        ]
+        for en_keys, cn_subs in KEYWORD_MAP:
+            if any(k in paren_lower for k in en_keys):
+                for cn_sub in cn_subs:
+                    for rn in cn_reg:
+                        if cn_sub in rn:
+                            return f"{rn} {paren}"
+        return pa_name   # 无法修复则原样返回
+
     def _list_microphones():
-        """返回 [(index, name), ...] 的可用麦克风列表"""
+        """返回 [(pyaudio_index, name), ...] 的可用麦克风列表。
+        Windows 上用注册表 Unicode 名称修复 PyAudio 可能乱码的设备名前缀。
+        """
         pa = _pyaudio.PyAudio()
         devices = []
         for i in range(pa.get_device_count()):
@@ -17,6 +97,15 @@ try:
             if info.get("maxInputChannels", 0) > 0:
                 devices.append((i, info["name"]))
         pa.terminate()
+
+        if sys.platform == "win32":
+            try:
+                cn_reg = _registry_chinese_names()
+                devices = [(idx, _repair_device_name(name, cn_reg))
+                           for idx, name in devices]
+            except Exception as e:
+                print(f"[语音] 设备名修复失败: {e}")
+
         return devices
 
     def _select_microphone_index():
