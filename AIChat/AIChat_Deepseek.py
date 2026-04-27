@@ -192,22 +192,13 @@ def listen_from_microphone() -> str:
             except sr.WaitTimeoutError:
                 print("[语音] 未检测到声音，请重试。")
                 return ""
+    except KeyboardInterrupt:
+        raise   # Ctrl+C 直接向上传递，不吞掉
     except AssertionError:
-        print("[语音] 麦克风音频流未就绪，请检查设备是否被其他程序占用，或尝试选择其他设备。")
+        print("[语音] 麦克风音频流未就绪，请检查设备是否被其他程序占用。")
         return ""
     except Exception as e:
         print(f"[语音] 麦克风读取失败: {e}")
-        return ""
-    print("🔍 识别中...", flush=True)
-    try:
-        text = recognizer.recognize_google(audio, language="zh-CN")
-        print(f"你（语音）: {text}")
-        return text
-    except sr.UnknownValueError:
-        print("[语音] 未能识别，请重新说话。")
-        return ""
-    except sr.RequestError as e:
-        print(f"[语音] 识别服务出错: {e}")
         return ""
     print("🔍 识别中...", flush=True)
     try:
@@ -348,13 +339,17 @@ def main():
         # ── 获取用户输入 ──────────────────────────────────────────────
         if use_voice_input:
             user_input = ""
-            while not user_input:
-                user_input = listen_from_microphone()
-                if not user_input:
-                    retry = input("未识别到语音，按 Enter 重试，或输入文字: ").strip()
-                    if retry:
-                        user_input = retry
-                        break
+            try:
+                while not user_input:
+                    user_input = listen_from_microphone()
+                    if not user_input:
+                        retry = input("未识别到语音，按 Enter 重试，或输入文字: ").strip()
+                        if retry:
+                            user_input = retry
+                            break
+            except (KeyboardInterrupt, EOFError):
+                print("\n\n再见！")
+                break
         else:
             try:
                 user_input = input("\n你: ").strip()
