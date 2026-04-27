@@ -180,8 +180,8 @@ def listen_from_microphone() -> str:
     recognizer.pause_threshold = 1.0  # 停顿超过1秒即结束
     try:
         mic = sr.Microphone(device_index=_MIC_DEVICE_INDEX)
-    except OSError as e:
-        print(f"[语音] 无法打开麦克风设备: {e}")
+    except Exception as e:
+        print(f"[语音] 无法创建麦克风对象: {e}")
         return ""
     try:
         with mic as source:
@@ -192,8 +192,22 @@ def listen_from_microphone() -> str:
             except sr.WaitTimeoutError:
                 print("[语音] 未检测到声音，请重试。")
                 return ""
-    except OSError as e:
+    except AssertionError:
+        print("[语音] 麦克风音频流未就绪，请检查设备是否被其他程序占用，或尝试选择其他设备。")
+        return ""
+    except Exception as e:
         print(f"[语音] 麦克风读取失败: {e}")
+        return ""
+    print("🔍 识别中...", flush=True)
+    try:
+        text = recognizer.recognize_google(audio, language="zh-CN")
+        print(f"你（语音）: {text}")
+        return text
+    except sr.UnknownValueError:
+        print("[语音] 未能识别，请重新说话。")
+        return ""
+    except sr.RequestError as e:
+        print(f"[语音] 识别服务出错: {e}")
         return ""
     print("🔍 识别中...", flush=True)
     try:
