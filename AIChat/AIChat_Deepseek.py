@@ -190,9 +190,17 @@ DEEPSEEK_MODEL   = "deepseek-reasoner"
 def listen_from_microphone() -> str:
     """从麦克风录音并识别为文字，失败返回空字符串"""
     recognizer = sr.Recognizer()
-    recognizer.pause_threshold = 2.0       # 停顿超过2秒才结束，避免自然停顿被截断
-    recognizer.non_speaking_duration = 0.8 # 开始录音前的静音容忍
-    recognizer.energy_threshold = 300      # 录音启动灵敏度
+
+    # ── 关键：关闭动态阈值，防止录音中途自动调高阈值把说话间隙误判为静音 ──
+    recognizer.dynamic_energy_threshold = False
+
+    # 说话中途停顿超过 2.5 秒才结束录音（容纳思考停顿、换气等自然节奏）
+    recognizer.pause_threshold      = 2.5
+    # 句末静音缓冲，与 pause_threshold 配合
+    recognizer.non_speaking_duration = 1.2
+    # 最短有效语音帧（秒），过滤极短噪音
+    recognizer.phrase_threshold     = 0.1
+
     try:
         mic = sr.Microphone(device_index=_MIC_DEVICE_INDEX)
     except Exception as e:
@@ -200,32 +208,53 @@ def listen_from_microphone() -> str:
         return ""
     try:
         with mic as source:
-            print("🎤 正在聆听（说完后停顿2秒结束）...", flush=True)
-            recognizer.adjust_for_ambient_noise(source, duration=0.3)
+            # 用 1 秒充分校准环境噪音，之后固定阈值
+            recognizer.adjust_for_ambient_noise(source, duration=1.0)
+            # 在校准值基础上乘以 1.5 作为安全边距，避免轻微环境音触发结束
+            recognizer.energy_threshold = max(recognizer.energy_threshold * 1.5, 300)
+            _cached_energy_threshold = recognizer.energy_threshold
+            prompt = "正在聆听，你请说"
+            print(f"🎤 {prompt}（说完后停顿 2.5 秒结束，阈值={recognizer.energy_threshold:.0f}）...",
+                  flush=True)
+            speak(prompt)
             try:
-                audio = recognizer.listen(source, timeout=10, phrase_time_limit=30)
+                audio = recognizer.listen(source, timeout=10, phrase_time_limit=60)
             except sr.WaitTimeoutError:
-                print("[语音] 未检测到声音，请重试。")
+                msg = "未检测到声音，请重试。"
+                print(f"[语音] {msg}")
+                speak(msg)
                 return ""
     except KeyboardInterrupt:
         raise
     except AssertionError:
-        print("[语音] 麦克风音频流未就绪，请检查设备是否被其他程序占用。")
+        msg = "麦克风未就绪，请检查设备是否被其他程序占用。"
+        print(f"[语音] {msg}")
+        speak(msg)
         return ""
     except Exception as e:
         print(f"[语音] 麦克风读取失败: {e}")
         return ""
     print("🔍 识别中...", flush=True)
-    try:
-        text = recognizer.recognize_google(audio, language="zh-CN")
-        print(f"你（语音）: {text}")
-        return text
-    except sr.UnknownValueError:
-        print("[语音] 未能识别，请重新说话。")
-        return ""
-    except sr.RequestError as e:
-        print(f"[语音] 识别服务出错: {e}")
-        return ""
+    MAX_RETRIES = 3
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            text = recognizer.recognize_google(audio, language="zh-CN")
+            print(f"你（语音）: {text}")
+            return text
+        except sr.UnknownValueError:
+            msg = "未能识别，请重新说话。"
+            print(f"[语音] {msg}")
+            speak(msg)
+            return ""
+        except sr.RequestError as e:
+            if attempt < MAX_RETRIES:
+                print(f"[语音] 识别服务出错（第{attempt}次，正在重试）: {e}")
+                time.sleep(1)
+            else:
+                msg = "识别服务连接失败，请检查网络后重试。"
+                print(f"[语音] {msg} 错误: {e}")
+                speak(msg)
+                return ""
 
 
 # ── 语音输出 ─────────────────────────────────────────────────────────
@@ -277,32 +306,51 @@ def speak_interruptible(text: str) -> str:
     captured_audio = [None]   # 用列表传递跨线程的识别结果
 
     def _vad_and_capture():
-        """麦克风 VAD 监测：检测到说话 → 终止 TTS → 录音识别"""
+        """
+        VAD 监测 + 连续录音一体化：
+          阶段1：TTS 播放期间持续缓存音频帧（滚动窗口），检测到说话则进入阶段2
+          阶段2：保留阶段1缓存的"说话前1秒"帧，在同一个流上继续录音直到静音
+          把全部帧直接构造成 AudioData 送给 Google 识别，开头语音零丢失。
+        """
         if not VOICE_INPUT_AVAILABLE:
             return
         try:
             import pyaudio, struct, math
-            pa = pyaudio.PyAudio()
+            RATE          = 16000
+            CHUNK         = 1024
+            SAMPLE_WIDTH  = 2          # paInt16 = 2 bytes
+            VAD_THRESHOLD = 700        # RMS 触发阈值
+            CONFIRM_FRAMES = 3         # 连续 N 帧超阈值才确认说话
+            PRE_BUFFER_SEC = 1.0       # 保留说话触发前的缓存秒数
+            PAUSE_SEC      = 2.5       # 静音超过此秒数则结束录音
+
+            pre_buf_max = int(RATE * PRE_BUFFER_SEC / CHUNK)
+            pause_max   = int(RATE * PAUSE_SEC / CHUNK)
+
+            pa     = pyaudio.PyAudio()
             stream = pa.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=16000,
-                input=True,
-                input_device_index=_MIC_DEVICE_INDEX,
-                frames_per_buffer=1024,
+                format=pyaudio.paInt16, channels=1, rate=RATE,
+                input=True, input_device_index=_MIC_DEVICE_INDEX,
+                frames_per_buffer=CHUNK,
             )
-            # TTS 刚开始的短暂延迟，防止扬声器声音反馈触发
+
+            # TTS 刚开始时稍等，防止扬声器声音触发 VAD
             time.sleep(0.4)
 
-            VAD_THRESHOLD    = 700   # RMS 阈值，可按环境调整
-            CONFIRM_FRAMES   = 3     # 连续 N 帧超阈值才确认为说话
+            rolling    = []   # 滚动缓存（最近 PRE_BUFFER_SEC 的帧）
             consecutive = 0
 
+            # ── 阶段1：等待用户开口 ──────────────────────────────────
             while proc.poll() is None and not interrupted.is_set():
-                data = stream.read(1024, exception_on_overflow=False)
-                count = len(data) // 2
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                rolling.append(data)
+                if len(rolling) > pre_buf_max:
+                    rolling.pop(0)
+
+                count  = len(data) // 2
                 shorts = struct.unpack(f"{count}h", data)
-                rms = math.sqrt(sum(s * s for s in shorts) / count) if count else 0
+                rms    = math.sqrt(sum(s * s for s in shorts) / count) if count else 0
+
                 if rms > VAD_THRESHOLD:
                     consecutive += 1
                     if consecutive >= CONFIRM_FRAMES:
@@ -311,24 +359,64 @@ def speak_interruptible(text: str) -> str:
                 else:
                     consecutive = 0
 
-            stream.stop_stream()
-            stream.close()
-            pa.terminate()
+            if not interrupted.is_set():
+                stream.stop_stream(); stream.close(); pa.terminate()
+                return
 
-            if interrupted.is_set() and proc.poll() is None:
-                # 终止 TTS
+            # 终止 TTS 子进程
+            if proc.poll() is None:
                 proc.terminate()
                 try:
                     proc.wait(timeout=1)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                print("\n[打断] 请继续说...", flush=True)
-                # 必须先彻底关闭 VAD 的 PyAudio 流，再开新流录音
-                # 否则同一设备两个流并存会导致录音被截断
-                time.sleep(0.15)   # 等待设备释放
-                captured_audio[0] = listen_from_microphone()
-        except Exception:
-            pass
+
+            print("\n[打断] 正在聆听...", flush=True)
+            #speak("正在聆听，你请说")
+
+            # ── 阶段2：同一流继续录音，保留前1秒帧，直到静音 ────────
+            speech_frames = list(rolling)   # 包含触发前1秒，开头不丢
+            silent = 0
+            max_frames = int(RATE * 60 / CHUNK)   # 最长60秒保底
+
+            while len(speech_frames) < max_frames:
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                speech_frames.append(data)
+
+                count  = len(data) // 2
+                shorts = struct.unpack(f"{count}h", data)
+                rms    = math.sqrt(sum(s * s for s in shorts) / count) if count else 0
+
+                if rms < VAD_THRESHOLD * 0.6:
+                    silent += 1
+                    if silent >= pause_max:
+                        break
+                else:
+                    silent = 0
+
+            stream.stop_stream(); stream.close(); pa.terminate()
+
+            # ── 直接用收集到的帧构造 AudioData 识别，无需重开麦克风 ──
+            raw        = b"".join(speech_frames)
+            audio_data = sr.AudioData(raw, RATE, SAMPLE_WIDTH)
+
+            print("🔍 识别中...", flush=True)
+            recognizer = sr.Recognizer()
+            try:
+                text = recognizer.recognize_google(audio_data, language="zh-CN")
+                print(f"你（语音）: {text}")
+                captured_audio[0] = text
+            except sr.UnknownValueError:
+                msg = "未能识别，请重新说话。"
+                print(f"[语音] {msg}")
+                speak(msg)
+                captured_audio[0] = ""
+            except sr.RequestError as e:
+                print(f"[语音] 识别服务出错: {e}")
+                captured_audio[0] = ""
+
+        except Exception as e:
+            print(f"[语音] VAD 异常: {e}")
 
     vad_thread = threading.Thread(target=_vad_and_capture, daemon=True)
     vad_thread.start()
