@@ -185,8 +185,71 @@ DEEPSEEK_API_KEY = "sk-892f8f3341d34354b8d245ade13d9269"
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL   = "deepseek-reasoner"
 
+# ── Whisper 离线语音识别模型 ─────────────────────────────────────────
+# 模型选项: tiny / base / small / medium / large-v3（越大越准，占用越多）
+WHISPER_MODEL_SIZE = "small"
+try:
+    from faster_whisper import WhisperModel as _WhisperModel
+    import numpy as _np
+    print(f"[语音] 正在加载 faster-whisper {WHISPER_MODEL_SIZE} 模型...", flush=True)
+    _whisper_model = _WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+    WHISPER_AVAILABLE = True
+    print(f"[语音] faster-whisper {WHISPER_MODEL_SIZE} 加载完成，使用本地离线识别")
+except ImportError:
+    WHISPER_AVAILABLE = False
+    _whisper_model = None
+    print("[提示] 未安装 faster-whisper，将回退到 Google 在线识别。"
+          "可运行: pip install faster-whisper")
+except Exception as e:
+    WHISPER_AVAILABLE = False
+    _whisper_model = None
+    print(f"[提示] faster-whisper 加载失败: {e}，将回退到 Google 在线识别。")
 
-# ── 语音输入 ─────────────────────────────────────────────────────────
+
+def _recognize(audio_data) -> str:
+    """统一语音识别入口。
+    优先使用本地 faster-whisper 离线识别（快、准、无网络依赖）；
+    不可用时回退到 Google 在线识别（含重试）。
+    audio_data 可以是 sr.AudioData 或 bytes（int16 PCM，16000Hz）。
+    """
+    # ── faster-whisper 离线识别 ───────────────────────────────────────
+    if WHISPER_AVAILABLE and _whisper_model is not None:
+        try:
+            if isinstance(audio_data, (bytes, bytearray)):
+                raw_pcm = audio_data
+            else:
+                raw_pcm = audio_data.get_raw_data(convert_rate=16000, convert_width=2)
+            audio_np = _np.frombuffer(raw_pcm, dtype=_np.int16).astype(_np.float32) / 32768.0
+            segments, _ = _whisper_model.transcribe(
+                audio_np,
+                language="zh",
+                beam_size=3,       # 减小 beam_size 加快速度
+                vad_filter=True,   # 内置 VAD 过滤静音，减少误识别
+                vad_parameters={"min_silence_duration_ms": 300},
+            )
+            text = "".join(seg.text for seg in segments).strip()
+            return text
+        except Exception as e:
+            print(f"[语音] faster-whisper 识别异常，回退 Google: {e}")
+
+    # ── Google 在线识别（回退）──────────────────────────────────────────
+    recognizer = sr.Recognizer()
+    MAX_RETRIES = 3
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            text = recognizer.recognize_google(audio_data, language="zh-CN")
+            return text
+        except sr.UnknownValueError:
+            return ""
+        except sr.RequestError as e:
+            if attempt < MAX_RETRIES:
+                print(f"[语音] Google 识别出错（第{attempt}次，重试中）: {e}")
+                time.sleep(1)
+            else:
+                raise
+    return ""
+
+
 def listen_from_microphone() -> str:
     """从麦克风录音并识别为文字，失败返回空字符串"""
     recognizer = sr.Recognizer()
@@ -213,7 +276,7 @@ def listen_from_microphone() -> str:
             # 在校准值基础上乘以 1.5 作为安全边距，避免轻微环境音触发结束
             recognizer.energy_threshold = max(recognizer.energy_threshold * 1.5, 300)
             _cached_energy_threshold = recognizer.energy_threshold
-            prompt = "请说话"
+            prompt = "正在聆听，你请说"
             print(f"🎤 {prompt}（说完后停顿 2.5 秒结束，阈值={recognizer.energy_threshold:.0f}）...",
                   flush=True)
             speak(prompt)
@@ -235,26 +298,24 @@ def listen_from_microphone() -> str:
         print(f"[语音] 麦克风读取失败: {e}")
         return ""
     print("🔍 识别中...", flush=True)
-    MAX_RETRIES = 3
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            text = recognizer.recognize_google(audio, language="zh-CN")
+    try:
+        text = _recognize(audio)
+        if text:
             print(f"你（语音）: {text}")
             return text
-        except sr.UnknownValueError:
+        else:
             msg = "未能识别，请重新说话。"
             print(f"[语音] {msg}")
             speak(msg)
             return ""
-        except sr.RequestError as e:
-            if attempt < MAX_RETRIES:
-                print(f"[语音] 识别服务出错（第{attempt}次，正在重试）: {e}")
-                time.sleep(1)
-            else:
-                msg = "识别服务连接失败，请检查网络后重试。"
-                print(f"[语音] {msg} 错误: {e}")
-                speak(msg)
-                return ""
+    except sr.RequestError as e:
+        msg = "识别服务连接失败，请检查网络后重试。"
+        print(f"[语音] {msg} 错误: {e}")
+        speak(msg)
+        return ""
+    except Exception as e:
+        print(f"[语音] 识别异常: {e}")
+        return ""
 
 
 # ── 语音输出 ─────────────────────────────────────────────────────────
@@ -372,7 +433,7 @@ def speak_interruptible(text: str) -> str:
                     proc.kill()
 
             print("\n[打断] 正在聆听...", flush=True)
-            #speak("请说话")
+            #speak("正在聆听, 你请说")
 
             # ── 阶段2：同一流继续录音，保留前1秒帧，直到静音 ────────
             speech_frames = list(rolling)   # 包含触发前1秒，开头不丢
@@ -401,29 +462,21 @@ def speak_interruptible(text: str) -> str:
             audio_data = sr.AudioData(raw, RATE, SAMPLE_WIDTH)
 
             print("🔍 识别中...", flush=True)
-            recognizer = sr.Recognizer()
-            MAX_RETRIES = 3
-            for attempt in range(1, MAX_RETRIES + 1):
-                try:
-                    text = recognizer.recognize_google(audio_data, language="zh-CN")
+            try:
+                text = _recognize(audio_data)
+                if text:
                     print(f"你（语音）: {text}")
                     captured_audio[0] = text
-                    break
-                except sr.UnknownValueError:
+                else:
                     msg = "未能识别，请重新说话。"
                     print(f"[语音] {msg}")
                     speak(msg)
                     captured_audio[0] = ""
-                    break
-                except sr.RequestError as e:
-                    if attempt < MAX_RETRIES:
-                        print(f"[语音] 识别服务出错（第{attempt}次，正在重试）: {e}")
-                        time.sleep(1)
-                    else:
-                        msg = "识别服务连接失败，请检查网络后重试。"
-                        print(f"[语音] {msg} 错误: {e}")
-                        speak(msg)
-                        captured_audio[0] = ""
+            except Exception as e:
+                msg = "识别服务连接失败，请检查网络后重试。"
+                print(f"[语音] {msg} 错误: {e}")
+                speak(msg)
+                captured_audio[0] = ""
 
         except Exception as e:
             print(f"[语音] VAD 异常: {e}")
