@@ -213,7 +213,7 @@ def listen_from_microphone() -> str:
             # 在校准值基础上乘以 1.5 作为安全边距，避免轻微环境音触发结束
             recognizer.energy_threshold = max(recognizer.energy_threshold * 1.5, 300)
             _cached_energy_threshold = recognizer.energy_threshold
-            prompt = "正在聆听，你请说"
+            prompt = "请说话"
             print(f"🎤 {prompt}（说完后停顿 2.5 秒结束，阈值={recognizer.energy_threshold:.0f}）...",
                   flush=True)
             speak(prompt)
@@ -372,7 +372,7 @@ def speak_interruptible(text: str) -> str:
                     proc.kill()
 
             print("\n[打断] 正在聆听...", flush=True)
-            #speak("正在聆听，你请说")
+            #speak("请说话")
 
             # ── 阶段2：同一流继续录音，保留前1秒帧，直到静音 ────────
             speech_frames = list(rolling)   # 包含触发前1秒，开头不丢
@@ -402,18 +402,28 @@ def speak_interruptible(text: str) -> str:
 
             print("🔍 识别中...", flush=True)
             recognizer = sr.Recognizer()
-            try:
-                text = recognizer.recognize_google(audio_data, language="zh-CN")
-                print(f"你（语音）: {text}")
-                captured_audio[0] = text
-            except sr.UnknownValueError:
-                msg = "未能识别，请重新说话。"
-                print(f"[语音] {msg}")
-                speak(msg)
-                captured_audio[0] = ""
-            except sr.RequestError as e:
-                print(f"[语音] 识别服务出错: {e}")
-                captured_audio[0] = ""
+            MAX_RETRIES = 3
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    text = recognizer.recognize_google(audio_data, language="zh-CN")
+                    print(f"你（语音）: {text}")
+                    captured_audio[0] = text
+                    break
+                except sr.UnknownValueError:
+                    msg = "未能识别，请重新说话。"
+                    print(f"[语音] {msg}")
+                    speak(msg)
+                    captured_audio[0] = ""
+                    break
+                except sr.RequestError as e:
+                    if attempt < MAX_RETRIES:
+                        print(f"[语音] 识别服务出错（第{attempt}次，正在重试）: {e}")
+                        time.sleep(1)
+                    else:
+                        msg = "识别服务连接失败，请检查网络后重试。"
+                        print(f"[语音] {msg} 错误: {e}")
+                        speak(msg)
+                        captured_audio[0] = ""
 
         except Exception as e:
             print(f"[语音] VAD 异常: {e}")
