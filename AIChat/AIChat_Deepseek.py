@@ -154,18 +154,28 @@ except ImportError:
 try:
     import pyttsx3
     _tts_engine = pyttsx3.init()
-    # 优先选择中文语音
+    # 列出并选择中文语音
+    _selected_voice = None
     for voice in _tts_engine.getProperty("voices"):
         if "chinese" in voice.name.lower() or "zh" in voice.id.lower():
             _tts_engine.setProperty("voice", voice.id)
+            _selected_voice = voice.name
             break
-    _tts_engine.setProperty("rate", 180)   # 语速
-    _tts_engine.setProperty("volume", 1.0) # 音量
+    if _selected_voice:
+        print(f"[语音] TTS 已选中文语音: {_selected_voice}")
+    else:
+        # 未找到中文语音，列出所有可用语音供参考
+        all_voices = [v.name for v in _tts_engine.getProperty("voices")]
+        print(f"[语音] 未找到中文 TTS 语音，将使用默认语音。当前可用语音: {all_voices}")
+    _tts_engine.setProperty("rate", 180)
+    _tts_engine.setProperty("volume", 1.0)
     VOICE_OUTPUT_AVAILABLE = True
-except Exception:
+except ImportError:
     VOICE_OUTPUT_AVAILABLE = False
-    print("[提示] 未安装 pyttsx3，语音输出不可用。"
-          "可运行: pip install pyttsx3")
+    print("[提示] 未安装 pyttsx3，语音输出不可用。可运行: pip install pyttsx3")
+except Exception as e:
+    VOICE_OUTPUT_AVAILABLE = False
+    print(f"[提示] pyttsx3 初始化失败: {e}，语音输出不可用。")
 
 # ── DeepSeek 配置 ────────────────────────────────────────────────────
 DEEPSEEK_API_KEY = "sk-892f8f3341d34354b8d245ade13d9269"
@@ -215,14 +225,33 @@ def listen_from_microphone() -> str:
 
 # ── 语音输出 ─────────────────────────────────────────────────────────
 def speak(text: str):
-    """将文字朗读出来"""
+    """将文字朗读出来。
+    通过独立子进程运行 pyttsx3，彻底规避同进程单例和 SAPI5 事件循环问题，
+    保证每次都能正常播放。
+    """
     if not VOICE_OUTPUT_AVAILABLE:
         return
+    import subprocess
+    script = (
+        "import pyttsx3;"
+        "e=pyttsx3.init();"
+        + (f"[e.setProperty('voice',v.id) for v in e.getProperty('voices') if v.name=={repr(_selected_voice)}];" if _selected_voice else "")
+        + f"e.setProperty('rate',180);"
+        f"e.setProperty('volume',1.0);"
+        f"e.say({repr(text)});"
+        f"e.runAndWait()"
+    )
     try:
-        _tts_engine.say(text)
-        _tts_engine.runAndWait()
+        subprocess.run(
+            [sys.executable, "-c", script],
+            timeout=60,       # 最长等待60秒，防止异常卡死
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        print("[语音] 朗读超时，已跳过。")
     except Exception as e:
-        print(f"[语音] 朗读出错: {e}")
+        print(f"[语音] 朗读失败: {e}")
+
 
 
 # ── AI 聊天（流式） ───────────────────────────────────────────────────
@@ -247,26 +276,32 @@ def chat(conversation_history, user_input):
 
     print("\nAI: ", end="", flush=True)
     full_reply = ""
-    for line in response.iter_lines():
-        if not line:
-            continue
-        text = line.decode("utf-8").strip()
-        if text.startswith("data: "):
-            text = text[6:]
-        if text == "[DONE]":
-            break
-        try:
-            chunk = json.loads(text)
-            delta = chunk["choices"][0].get("delta", {})
-            content = delta.get("content", "")
-            if content:
-                print(content, end="", flush=True)
-                full_reply += content
-        except json.JSONDecodeError:
-            continue
+    try:
+        for line in response.iter_lines():
+            if not line:
+                continue
+            text = line.decode("utf-8").strip()
+            if text.startswith("data: "):
+                text = text[6:]
+            if text == "[DONE]":
+                break
+            try:
+                chunk = json.loads(text)
+                delta = chunk["choices"][0].get("delta", {})
+                content = delta.get("content", "")
+                if content:
+                    print(content, end="", flush=True)
+                    full_reply += content
+            except json.JSONDecodeError:
+                continue
+    except Exception as e:
+        # 网络中断（IncompleteRead、ChunkedEncodingError 等）
+        # 已收到的内容保留，仅提示用户
+        print(f"\n[提示] 网络传输中断: {e}，已收到部分回复。", flush=True)
     print()
 
-    conversation_history.append({"role": "assistant", "content": full_reply})
+    if full_reply:
+        conversation_history.append({"role": "assistant", "content": full_reply})
     return conversation_history, full_reply
 
 
@@ -281,6 +316,8 @@ def choose_mode() -> str:
       'full'       语音输入 + 语音播报
     """
     print("\n请选择聊天模式：")
+    print(f"  [当前状态] 语音输入: {'\u2705 可用' if VOICE_INPUT_AVAILABLE else '\u274c 不可用'}  "
+          f"语音播报: {'\u2705 可用' if VOICE_OUTPUT_AVAILABLE else '\u274c 不可用'}")
     print("  1. 纯文字（默认）")
     if VOICE_INPUT_AVAILABLE and VOICE_OUTPUT_AVAILABLE:
         print("  2. 纯语音（语音输入 + 语音播报）")
