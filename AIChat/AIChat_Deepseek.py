@@ -1,6 +1,9 @@
 import os
 import sys
 import io
+import threading
+import time
+import subprocess
 
 # ── Windows 控制台强制使用 UTF-8 编码（解决中文乱码）────────────────────
 if sys.platform == "win32":
@@ -187,7 +190,9 @@ DEEPSEEK_MODEL   = "deepseek-reasoner"
 def listen_from_microphone() -> str:
     """从麦克风录音并识别为文字，失败返回空字符串"""
     recognizer = sr.Recognizer()
-    recognizer.pause_threshold = 1.0  # 停顿超过1秒即结束
+    recognizer.pause_threshold = 2.0       # 停顿超过2秒才结束，避免自然停顿被截断
+    recognizer.non_speaking_duration = 0.8 # 开始录音前的静音容忍
+    recognizer.energy_threshold = 300      # 录音启动灵敏度
     try:
         mic = sr.Microphone(device_index=_MIC_DEVICE_INDEX)
     except Exception as e:
@@ -195,15 +200,15 @@ def listen_from_microphone() -> str:
         return ""
     try:
         with mic as source:
-            print("🎤 正在聆听（说话后停顿即结束）...", flush=True)
-            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            print("🎤 正在聆听（说完后停顿2秒结束）...", flush=True)
+            recognizer.adjust_for_ambient_noise(source, duration=0.3)
             try:
-                audio = recognizer.listen(source, timeout=8, phrase_time_limit=20)
+                audio = recognizer.listen(source, timeout=10, phrase_time_limit=30)
             except sr.WaitTimeoutError:
                 print("[语音] 未检测到声音，请重试。")
                 return ""
     except KeyboardInterrupt:
-        raise   # Ctrl+C 直接向上传递，不吞掉
+        raise
     except AssertionError:
         print("[语音] 麦克风音频流未就绪，请检查设备是否被其他程序占用。")
         return ""
@@ -224,33 +229,120 @@ def listen_from_microphone() -> str:
 
 
 # ── 语音输出 ─────────────────────────────────────────────────────────
-def speak(text: str):
-    """将文字朗读出来。
-    通过独立子进程运行 pyttsx3，彻底规避同进程单例和 SAPI5 事件循环问题，
-    保证每次都能正常播放。
-    """
-    if not VOICE_OUTPUT_AVAILABLE:
-        return
-    import subprocess
-    script = (
+def _build_tts_script(text: str) -> str:
+    """构建 pyttsx3 子进程执行脚本"""
+    voice_line = (
+        f"[e.setProperty('voice',v.id) for v in e.getProperty('voices') if v.name=={repr(_selected_voice)}];"
+        if _selected_voice else ""
+    )
+    return (
         "import pyttsx3;"
         "e=pyttsx3.init();"
-        + (f"[e.setProperty('voice',v.id) for v in e.getProperty('voices') if v.name=={repr(_selected_voice)}];" if _selected_voice else "")
-        + f"e.setProperty('rate',180);"
-        f"e.setProperty('volume',1.0);"
+        + voice_line
+        + "e.setProperty('rate',180);"
+        "e.setProperty('volume',1.0);"
         f"e.say({repr(text)});"
-        f"e.runAndWait()"
+        "e.runAndWait()"
     )
+
+
+def speak(text: str):
+    """不可打断的语音播放（用于退出提示等简短语句）"""
+    if not VOICE_OUTPUT_AVAILABLE:
+        return
     try:
         subprocess.run(
-            [sys.executable, "-c", script],
-            timeout=60,       # 最长等待60秒，防止异常卡死
-            check=False,
+            [sys.executable, "-c", _build_tts_script(text)],
+            timeout=30, check=False,
         )
     except subprocess.TimeoutExpired:
-        print("[语音] 朗读超时，已跳过。")
+        pass
     except Exception as e:
         print(f"[语音] 朗读失败: {e}")
+
+
+def speak_interruptible(text: str) -> str:
+    """可打断的语音播放。
+
+    在语音输出的同时，通过 PyAudio 实时监测麦克风音量。
+    用户开口说话（音量超过阈值）时，立刻终止 TTS 子进程，
+    然后调用语音识别，将识别结果作为返回值返回。
+    未被打断则返回空字符串。
+    """
+    if not VOICE_OUTPUT_AVAILABLE:
+        return ""
+
+    proc = subprocess.Popen([sys.executable, "-c", _build_tts_script(text)])
+    interrupted = threading.Event()
+    captured_audio = [None]   # 用列表传递跨线程的识别结果
+
+    def _vad_and_capture():
+        """麦克风 VAD 监测：检测到说话 → 终止 TTS → 录音识别"""
+        if not VOICE_INPUT_AVAILABLE:
+            return
+        try:
+            import pyaudio, struct, math
+            pa = pyaudio.PyAudio()
+            stream = pa.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=16000,
+                input=True,
+                input_device_index=_MIC_DEVICE_INDEX,
+                frames_per_buffer=1024,
+            )
+            # TTS 刚开始的短暂延迟，防止扬声器声音反馈触发
+            time.sleep(0.4)
+
+            VAD_THRESHOLD    = 700   # RMS 阈值，可按环境调整
+            CONFIRM_FRAMES   = 3     # 连续 N 帧超阈值才确认为说话
+            consecutive = 0
+
+            while proc.poll() is None and not interrupted.is_set():
+                data = stream.read(1024, exception_on_overflow=False)
+                count = len(data) // 2
+                shorts = struct.unpack(f"{count}h", data)
+                rms = math.sqrt(sum(s * s for s in shorts) / count) if count else 0
+                if rms > VAD_THRESHOLD:
+                    consecutive += 1
+                    if consecutive >= CONFIRM_FRAMES:
+                        interrupted.set()
+                        break
+                else:
+                    consecutive = 0
+
+            stream.stop_stream()
+            stream.close()
+            pa.terminate()
+
+            if interrupted.is_set() and proc.poll() is None:
+                # 终止 TTS
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                print("\n[打断] 请继续说...", flush=True)
+                # 必须先彻底关闭 VAD 的 PyAudio 流，再开新流录音
+                # 否则同一设备两个流并存会导致录音被截断
+                time.sleep(0.15)   # 等待设备释放
+                captured_audio[0] = listen_from_microphone()
+        except Exception:
+            pass
+
+    vad_thread = threading.Thread(target=_vad_and_capture, daemon=True)
+    vad_thread.start()
+
+    # 等待 TTS 播完或被打断
+    try:
+        proc.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+    interrupted.set()          # 通知 VAD 线程退出（若 TTS 已自然结束）
+    vad_thread.join(timeout=15)  # 等待识别完成
+
+    return captured_audio[0] or ""
 
 
 
@@ -371,10 +463,15 @@ def main():
 
     use_voice_input  = mode in ("full", "voice+text")
     use_voice_output = mode in ("full", "text+voice")
+    interrupted_input: str = ""   # 打断 TTS 时捕获的语音文字
 
     while True:
         # ── 获取用户输入 ──────────────────────────────────────────────
-        if use_voice_input:
+        if interrupted_input:
+            # 上一轮 TTS 被打断，直接使用打断时识别到的文字
+            user_input = interrupted_input
+            interrupted_input = ""
+        elif use_voice_input:
             user_input = ""
             try:
                 while not user_input:
@@ -430,7 +527,11 @@ def main():
         try:
             conversation_history, reply = chat(conversation_history, user_input)
             if use_voice_output and reply:
-                speak(reply)
+                if use_voice_input:
+                    # 语音输入模式：支持打断，打断时捕获的文字直接用于下一轮
+                    interrupted_input = speak_interruptible(reply)
+                else:
+                    speak(reply)
         except Exception as e:
             print(f"\n请求出错: {e}")
 
