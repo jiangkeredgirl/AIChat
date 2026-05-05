@@ -1,0 +1,7 @@
+AccessKeyId: AKLTY2FkZTFjMzAwMjk3NDAyYjk0YmI4M2RiMWQyMTcwMTE
+SecretAccessKey: T0RGak5tRm1OMk5tWVRCa05HUXdZV0ppTTJWaE1EVXdNRE15TWpBMU5XRQ==
+aiaudiochat APP ID 9928059183
+API_KEY = "ark-ce45b71c-48f6-4b17-bf2d-95b41405ffff-7b27f"
+API_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+MODEL = "doubao-seed-2-0-pro-260215"  
+
