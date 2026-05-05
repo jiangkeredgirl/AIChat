@@ -33,7 +33,7 @@ if sys.platform == "win32":
 # ════════════════════════════════════════════════════════════════════════
 
 API_KEY   = "ark-ce45b71c-48f6-4b17-bf2d-95b41405ffff-7b27f"
-APP_ID    = "3"
+APP_ID    = "9928059183"
 
 # 文字聊天 REST 接口
 CHAT_URL   = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
