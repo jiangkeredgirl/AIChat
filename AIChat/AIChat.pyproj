@@ -22,8 +22,27 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="AIChat\probe_asr.py" />
+    <Compile Include="AIChat\probe_asr2.py" />
+    <Compile Include="AIChat\probe_asr3.py" />
+    <Compile Include="AIChat\probe_asr_fixed.py" />
+    <Compile Include="AIChat\probe_asr_full.py" />
+    <Compile Include="AIChat\probe_asr_seq.py" />
+    <Compile Include="AIChat\probe_asr_v2.py" />
+    <Compile Include="AIChat\probe_bugs.py" />
+    <Compile Include="AIChat\probe_bugs2.py" />
+    <Compile Include="AIChat\probe_bugs3.py" />
+    <Compile Include="AIChat\probe_bugs4.py" />
+    <Compile Include="AIChat\probe_bugs5.py" />
+    <Compile Include="AIChat\probe_cluster.py" />
+    <Compile Include="AIChat\probe_decode_err.py" />
+    <Compile Include="AIChat\test_doubao_components.py" />
+    <Compile Include="AIChat\write_test.py" />
     <Compile Include="AIChat_Deepseek.py" />
     <Compile Include="AIChat_Doubao.py" />
+  </ItemGroup>
+  <ItemGroup>
+    <Folder Include="AIChat\" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in
