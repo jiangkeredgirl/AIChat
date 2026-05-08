@@ -112,45 +112,43 @@ try:
         return devices
 
     def _select_microphone_index():
-        """自动或交互选择麦克风设备索引，无可用设备返回 None"""
-        devices = _list_microphones()
-        if not devices:
-            return None
-        # 只有一个设备直接使用
-        if len(devices) == 1:
-            print(f"[语音] 使用麦克风: {devices[0][1]}")
-            return devices[0][0]
-        # 多个设备尝试获取系统默认
+        """选择最佳麦克风设备，优先级: WASAPI > DirectSound > MME > WDM-KS。
+        返回 (device_index, native_sample_rate) 或 (None, 16000)。
+        """
         pa = _pyaudio.PyAudio()
-        default_idx = None
-        try:
-            default_idx = pa.get_default_input_device_info()["index"]
-        except OSError:
-            pass
+        buckets = {"wasapi": [], "directsound": [], "mme": [], "other": []}
+        for i in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(i)
+            if info.get("maxInputChannels", 0) <= 0:
+                continue
+            api_name = pa.get_host_api_info_by_index(info["hostApi"]).get("name", "").lower()
+            native_rate = int(info.get("defaultSampleRate", 16000))
+            entry = (i, info.get("name", ""), native_rate)
+            if "wasapi" in api_name:
+                buckets["wasapi"].append(entry)
+            elif "directsound" in api_name:
+                buckets["directsound"].append(entry)
+            elif "mme" in api_name:
+                buckets["mme"].append(entry)
+            else:
+                buckets["other"].append(entry)
         pa.terminate()
-        if default_idx is not None:
-            name = next((n for i, n in devices if i == default_idx), "")
-            print(f"[语音] 使用默认麦克风: {name}")
-            return default_idx
-        # 无默认设备则让用户选择
-        print("\n检测到多个麦克风设备，请选择：")
-        for idx, (dev_i, name) in enumerate(devices):
-            print(f"  {idx + 1}. [{dev_i}] {name}")
-        while True:
-            choice = input(f"输入编号（1-{len(devices)}）: ").strip()
-            if choice.isdigit() and 1 <= int(choice) <= len(devices):
-                selected = devices[int(choice) - 1]
-                print(f"[语音] 已选择: {selected[1]}")
-                return selected[0]
-            print("输入无效，请重新输入。")
 
-    _MIC_DEVICE_INDEX = _select_microphone_index()
+        for key in ("wasapi", "directsound", "mme", "other"):
+            if buckets[key]:
+                idx, name, rate = buckets[key][0]
+                print(f"[语音] 麦克风: [{idx}] {name}  API={key.upper()}  rate={rate}Hz")
+                return idx, rate
+        return None, 16000
+
+    _MIC_DEVICE_INDEX, _MIC_NATIVE_RATE = _select_microphone_index()
     VOICE_INPUT_AVAILABLE = _MIC_DEVICE_INDEX is not None
     if not VOICE_INPUT_AVAILABLE:
         print("[提示] 未检测到可用麦克风设备，语音输入不可用。")
 except ImportError:
     VOICE_INPUT_AVAILABLE = False
     _MIC_DEVICE_INDEX = None
+    _MIC_NATIVE_RATE  = 16000
     print("[提示] 未安装 speech_recognition / pyaudio，语音输入不可用。"
           "可运行: pip install SpeechRecognition pyaudio")
 
@@ -259,71 +257,147 @@ def _recognize(audio_data) -> str:
 
 
 def listen_from_microphone() -> str:
-    """从麦克风录音并识别为文字，失败返回空字符串"""
-    recognizer = sr.Recognizer()
+    """从麦克风录音并识别为文字，失败返回空字符串。
 
-    # ── 关键：关闭动态阈值，防止录音中途自动调高阈值把说话间隙误判为静音 ──
-    recognizer.dynamic_energy_threshold = False
+    使用 PyAudio 回调模式（非阻塞）：回调把每帧放入 Queue，
+    主线程用 queue.get(timeout) 读取，驱动无论是否正常都不会永久阻塞。
+    """
+    import queue as _queue, struct as _struct, math as _math
 
-    # 说话中途停顿超过 2.5 秒才结束录音（容纳思考停顿、换气等自然节奏）
-    recognizer.pause_threshold      = 2.5
-    # 句末静音缓冲，与 pause_threshold 配合
-    recognizer.non_speaking_duration = 1.2
-    # 最短有效语音帧（秒），过滤极短噪音
-    recognizer.phrase_threshold     = 0.1
+    RATE         = _MIC_NATIVE_RATE   # 使用设备原生采样率，避免重采样失败
+    CHUNK        = 1024
+    SAMPLE_WIDTH = 2
+    LISTEN_SEC   = 10
+    PAUSE_SEC    = 2.5
+    MAX_REC_SEC  = 60
 
-    try:
-        mic = sr.Microphone(device_index=_MIC_DEVICE_INDEX)
-    except Exception as e:
-        print(f"[语音] 无法创建麦克风对象: {e}")
-        return ""
-    try:
-        with mic as source:
-            # 用 1 秒充分校准环境噪音，之后固定阈值
-            recognizer.adjust_for_ambient_noise(source, duration=1.0)
-            # 在校准值基础上乘以 1.5 作为安全边距，避免轻微环境音触发结束
-            recognizer.energy_threshold = max(recognizer.energy_threshold * 1.5, 300)
-            _cached_energy_threshold = recognizer.energy_threshold
-            prompt = "正在聆听，你请说"
-            print(f"🎤 {prompt}（说完后停顿 2.5 秒结束，阈值={recognizer.energy_threshold:.0f}）...",
-                  flush=True)
-            speak(prompt)
-            try:
-                audio = recognizer.listen(source, timeout=10, phrase_time_limit=60)
-            except sr.WaitTimeoutError:
-                msg = "未检测到声音，请重试。"
-                print(f"[语音] {msg}")
-                speak(msg)
+    # 候选设备：首选 _MIC_DEVICE_INDEX（已按 WASAPI > DS > MME 优先级选出）
+    candidates = [_MIC_DEVICE_INDEX]
+
+    for dev_idx in candidates:
+        audio_q = _queue.Queue()
+
+        def _cb(in_data, frame_count, time_info, status, _q=audio_q):
+            _q.put(in_data)
+            return (None, _pyaudio.paContinue)
+
+        pa     = _pyaudio.PyAudio()
+        stream = None
+        try:
+            stream = pa.open(
+                format=_pyaudio.paInt16,
+                channels=1,
+                rate=RATE,
+                input=True,
+                input_device_index=dev_idx,
+                frames_per_buffer=CHUNK,
+                stream_callback=_cb,
+            )
+            stream.start_stream()
+        except Exception as e:
+            print(f"[麦克风] 设备 {dev_idx} 打开失败: {e}", flush=True)
+            if stream:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            pa.terminate()
+            continue
+
+        print(f"🎤 请说话 (设备={dev_idx} {RATE}Hz，{LISTEN_SEC}s无声超时，停顿{PAUSE_SEC}s结束)",
+              flush=True)
+
+        try:
+            # ── 校准环境噪音 0.5s ─────────────────────────────────────
+            cal, cal_deadline = [], time.time() + 2.0
+            cal_target = max(1, int(RATE * 0.5 / CHUNK))
+            while len(cal) < cal_target and time.time() < cal_deadline:
+                try:
+                    cal.append(audio_q.get(timeout=0.2))
+                except _queue.Empty:
+                    pass
+
+            if not cal:
+                print("[麦克风] 回调无数据，设备不可用", flush=True)
                 return ""
-    except KeyboardInterrupt:
-        raise
-    except AssertionError:
-        msg = "麦克风未就绪，请检查设备是否被其他程序占用。"
-        print(f"[语音] {msg}")
-        speak(msg)
-        return ""
-    except Exception as e:
-        print(f"[语音] 麦克风读取失败: {e}")
-        return ""
-    print("🔍 识别中...", flush=True)
-    try:
-        text = _recognize(audio)
-        if text:
-            print(f"你（语音）: {text}")
-            return text
-        else:
-            msg = "未能识别，请重新说话。"
-            print(f"[语音] {msg}")
-            speak(msg)
-            return ""
-    except sr.RequestError as e:
-        msg = "识别服务连接失败，请检查网络后重试。"
-        print(f"[语音] {msg} 错误: {e}")
-        speak(msg)
-        return ""
-    except Exception as e:
-        print(f"[语音] 识别异常: {e}")
-        return ""
+
+            raw_cal = b"".join(cal)
+            cnt     = len(raw_cal) // 2
+            shorts  = _struct.unpack(f"{cnt}h", raw_cal)
+            ambient = _math.sqrt(sum(s * s for s in shorts) / cnt)
+            thr     = max(ambient * 1.5, 300)
+            print(f"  噪音阈值={thr:.0f}", flush=True)
+
+            # ── 等待说话开始 ──────────────────────────────────────────
+            deadline = time.time() + LISTEN_SEC
+            frames, speech = [], False
+            while time.time() < deadline:
+                try:
+                    chunk = audio_q.get(timeout=0.1)
+                except _queue.Empty:
+                    continue
+                cnt    = len(chunk) // 2
+                shorts = _struct.unpack(f"{cnt}h", chunk)
+                rms    = _math.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
+                if rms > thr:
+                    frames = [chunk]
+                    speech = True
+                    break
+
+            if not speech:
+                print(f"[语音] {LISTEN_SEC}s 内未检测到声音", flush=True)
+                return ""
+
+            # ── 录音直到静音 ──────────────────────────────────────────
+            silence_cnt  = 0
+            pause_chunks = max(1, int(RATE * PAUSE_SEC / CHUNK))
+            deadline2    = time.time() + MAX_REC_SEC
+            while time.time() < deadline2:
+                try:
+                    chunk = audio_q.get(timeout=0.5)
+                except _queue.Empty:
+                    break
+                frames.append(chunk)
+                cnt    = len(chunk) // 2
+                shorts = _struct.unpack(f"{cnt}h", chunk)
+                rms    = _math.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
+                if rms < thr * 0.6:
+                    silence_cnt += 1
+                    if silence_cnt >= pause_chunks:
+                        break
+                else:
+                    silence_cnt = 0
+
+            # ── 识别 ─────────────────────────────────────────────────
+            print("🔍 识别中...", flush=True)
+            audio_data = sr.AudioData(b"".join(frames), RATE, SAMPLE_WIDTH)
+            try:
+                text = _recognize(audio_data)
+                if text:
+                    print(f"你（语音）: {text}")
+                    return text
+                else:
+                    print("[语音] 未能识别", flush=True)
+                    return ""
+            except Exception as e:
+                print(f"[语音] 识别异常: {e}")
+                return ""
+
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(f"[麦克风] 设备 {dev_idx} 运行异常: {e}", flush=True)
+            continue
+        finally:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+            pa.terminate()
+
+    print("[麦克风] 无可用输入设备", flush=True)
+    return ""
 
 
 # ── 语音输出 ─────────────────────────────────────────────────────────
@@ -348,13 +422,17 @@ def speak(text: str):
     """不可打断的语音播放（用于退出提示等简短语句）"""
     if not VOICE_OUTPUT_AVAILABLE:
         return
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _build_tts_script(text)]
+    )
     try:
-        subprocess.run(
-            [sys.executable, "-c", _build_tts_script(text)],
-            timeout=30, check=False,
-        )
+        proc.wait(timeout=8)   # 最多等 8 秒
     except subprocess.TimeoutExpired:
-        pass
+        proc.kill()            # 超时强制 kill，防止僵尸进程
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
     except Exception as e:
         print(f"[语音] 朗读失败: {e}")
 
@@ -375,51 +453,54 @@ def speak_interruptible(text: str) -> str:
     captured_audio = [None]   # 用列表传递跨线程的识别结果
 
     def _vad_and_capture():
-        """
-        VAD 监测 + 连续录音一体化：
-          阶段1：TTS 播放期间持续缓存音频帧（滚动窗口），检测到说话则进入阶段2
-          阶段2：保留阶段1缓存的"说话前1秒"帧，在同一个流上继续录音直到静音
-          把全部帧直接构造成 AudioData 送给 Google 识别，开头语音零丢失。
-        """
+        """VAD 监测 + 连续录音（回调模式，不阻塞）"""
         if not VOICE_INPUT_AVAILABLE:
             return
         try:
-            import pyaudio, struct, math
-            RATE          = 16000
+            import queue as _q, struct as _s, math as _m
+            RATE          = _MIC_NATIVE_RATE
             CHUNK         = 1024
-            SAMPLE_WIDTH  = 2          # paInt16 = 2 bytes
-            VAD_THRESHOLD = 700        # RMS 触发阈值
-            CONFIRM_FRAMES = 3         # 连续 N 帧超阈值才确认说话
-            PRE_BUFFER_SEC = 1.0       # 保留说话触发前的缓存秒数
-            PAUSE_SEC      = 2.5       # 静音超过此秒数则结束录音
+            SAMPLE_WIDTH  = 2
+            VAD_THRESHOLD = 700
+            CONFIRM_FRAMES = 3
+            PRE_BUFFER_SEC = 1.0
+            PAUSE_SEC      = 2.5
 
             pre_buf_max = int(RATE * PRE_BUFFER_SEC / CHUNK)
             pause_max   = int(RATE * PAUSE_SEC / CHUNK)
 
-            pa     = pyaudio.PyAudio()
+            audio_q = _q.Queue()
+
+            def _cb(in_data, frame_count, time_info, status, _aq=audio_q):
+                _aq.put(in_data)
+                return (None, _pyaudio.paContinue)
+
+            pa = _pyaudio.PyAudio()
             stream = pa.open(
-                format=pyaudio.paInt16, channels=1, rate=RATE,
+                format=_pyaudio.paInt16, channels=1, rate=RATE,
                 input=True, input_device_index=_MIC_DEVICE_INDEX,
                 frames_per_buffer=CHUNK,
+                stream_callback=_cb,
             )
+            stream.start_stream()
 
-            # TTS 刚开始时稍等，防止扬声器声音触发 VAD
-            time.sleep(0.4)
+            time.sleep(0.4)   # 防止扬声器声音触发 VAD
 
-            rolling    = []   # 滚动缓存（最近 PRE_BUFFER_SEC 的帧）
+            rolling     = []
             consecutive = 0
 
-            # ── 阶段1：等待用户开口 ──────────────────────────────────
+            # ── 阶段1：等待用户开口（TTS 播放期间）──────────────────────
             while proc.poll() is None and not interrupted.is_set():
-                data = stream.read(CHUNK, exception_on_overflow=False)
+                try:
+                    data = audio_q.get(timeout=0.1)
+                except _q.Empty:
+                    continue
                 rolling.append(data)
                 if len(rolling) > pre_buf_max:
                     rolling.pop(0)
-
-                count  = len(data) // 2
-                shorts = struct.unpack(f"{count}h", data)
-                rms    = math.sqrt(sum(s * s for s in shorts) / count) if count else 0
-
+                cnt    = len(data) // 2
+                shorts = _s.unpack(f"{cnt}h", data)
+                rms    = _m.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
                 if rms > VAD_THRESHOLD:
                     consecutive += 1
                     if consecutive >= CONFIRM_FRAMES:
@@ -441,21 +522,21 @@ def speak_interruptible(text: str) -> str:
                     proc.kill()
 
             print("\n[打断] 正在聆听...", flush=True)
-            #speak("正在聆听, 你请说")
 
-            # ── 阶段2：同一流继续录音，保留前1秒帧，直到静音 ────────
-            speech_frames = list(rolling)   # 包含触发前1秒，开头不丢
-            silent = 0
-            max_frames = int(RATE * 60 / CHUNK)   # 最长60秒保底
+            # ── 阶段2：继续从回调队列录音，保留前1秒帧，直到静音 ────────
+            speech_frames = list(rolling)
+            silent        = 0
+            max_frames    = int(RATE * 60 / CHUNK)
 
             while len(speech_frames) < max_frames:
-                data = stream.read(CHUNK, exception_on_overflow=False)
+                try:
+                    data = audio_q.get(timeout=0.5)
+                except _q.Empty:
+                    break
                 speech_frames.append(data)
-
-                count  = len(data) // 2
-                shorts = struct.unpack(f"{count}h", data)
-                rms    = math.sqrt(sum(s * s for s in shorts) / count) if count else 0
-
+                cnt    = len(data) // 2
+                shorts = _s.unpack(f"{cnt}h", data)
+                rms    = _m.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
                 if rms < VAD_THRESHOLD * 0.6:
                     silent += 1
                     if silent >= pause_max:
@@ -465,10 +546,9 @@ def speak_interruptible(text: str) -> str:
 
             stream.stop_stream(); stream.close(); pa.terminate()
 
-            # ── 直接用收集到的帧构造 AudioData 识别，无需重开麦克风 ──
+            # ── 识别 ─────────────────────────────────────────────────
             raw        = b"".join(speech_frames)
             audio_data = sr.AudioData(raw, RATE, SAMPLE_WIDTH)
-
             print("🔍 识别中...", flush=True)
             try:
                 text = _recognize(audio_data)
@@ -476,14 +556,10 @@ def speak_interruptible(text: str) -> str:
                     print(f"你（语音）: {text}")
                     captured_audio[0] = text
                 else:
-                    msg = "未能识别，请重新说话。"
-                    print(f"[语音] {msg}")
-                    speak(msg)
+                    print("[语音] 未能识别，请重新说话。")
                     captured_audio[0] = ""
             except Exception as e:
-                msg = "识别服务连接失败，请检查网络后重试。"
-                print(f"[语音] {msg} 错误: {e}")
-                speak(msg)
+                print(f"[语音] 识别服务连接失败: {e}")
                 captured_audio[0] = ""
 
         except Exception as e:
@@ -632,16 +708,33 @@ def main():
             interrupted_input = ""
         elif use_voice_input:
             user_input = ""
+            consecutive_fails = 0
+            MAX_VOICE_FAILS   = 3
             try:
                 while not user_input:
                     user_input = listen_from_microphone()
                     if not user_input:
-                        retry = input("未识别到语音，按 Enter 重试，或输入文字: ").strip()
-                        if retry:
-                            user_input = retry
+                        consecutive_fails += 1
+                        if consecutive_fails >= MAX_VOICE_FAILS:
+                            print(f"[\u8bed\u97f3] \u8fde\u7eed {MAX_VOICE_FAILS} \u6b21\u65e0\u6cd5\u5f55\u97f3/\u8bc6\u522b\uff0c"
+                                  "\u5207\u6362\u4e3a\u6587\u5b57\u8f93\u5165\u6a21\u5f0f", flush=True)
+                            try:
+                                user_input = input("\n\u4f60(\u6587\u5b57): ").strip()
+                            except (KeyboardInterrupt, EOFError):
+                                raise
                             break
+                        if mode == "full":
+                            print(f"[\u8bed\u97f3] \u91cd\u8bd5 ({consecutive_fails}/{MAX_VOICE_FAILS})...",
+                                  flush=True)
+                        else:
+                            retry = input("\u672a\u8bc6\u522b\u5230\u8bed\u97f3\uff0c\u6309 Enter \u91cd\u8bd5\uff0c\u6216\u8f93\u5165\u6587\u5b57: ").strip()
+                            if retry:
+                                user_input = retry
+                                break
+                    else:
+                        consecutive_fails = 0
             except (KeyboardInterrupt, EOFError):
-                print("\n\n再见！")
+                print("\n\n\u518d\u89c1\uff01")
                 break
         else:
             try:
