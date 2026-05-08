@@ -185,34 +185,56 @@ DEEPSEEK_API_KEY = "sk-892f8f3341d34354b8d245ade13d9269"
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL   = "deepseek-reasoner"
 
-# ── Whisper 离线语音识别模型 ─────────────────────────────────────────
+# ── Whisper 离线语音识别模型（Google 在线识别失败时兜底）─────────────
 # 模型选项: tiny / base / small / medium / large-v3（越大越准，占用越多）
 WHISPER_MODEL_SIZE = "small"
 try:
     from faster_whisper import WhisperModel as _WhisperModel
     import numpy as _np
-    print(f"[语音] 正在加载 faster-whisper {WHISPER_MODEL_SIZE} 模型...", flush=True)
+    print(f"[语音] 正在加载 faster-whisper {WHISPER_MODEL_SIZE} 模型（Google 失败时兜底）...", flush=True)
     _whisper_model = _WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
     WHISPER_AVAILABLE = True
-    print(f"[语音] faster-whisper {WHISPER_MODEL_SIZE} 加载完成，使用本地离线识别")
+    print(f"[语音] faster-whisper {WHISPER_MODEL_SIZE} 加载完成，作为 Google 识别的离线兜底")
 except ImportError:
     WHISPER_AVAILABLE = False
     _whisper_model = None
-    print("[提示] 未安装 faster-whisper，将回退到 Google 在线识别。"
+    print("[提示] 未安装 faster-whisper，Google 识别失败时将无离线兜底。"
           "可运行: pip install faster-whisper")
 except Exception as e:
     WHISPER_AVAILABLE = False
     _whisper_model = None
-    print(f"[提示] faster-whisper 加载失败: {e}，将回退到 Google 在线识别。")
+    print(f"[提示] faster-whisper 加载失败: {e}，Google 识别失败时将无离线兜底。")
 
 
 def _recognize(audio_data) -> str:
     """统一语音识别入口。
-    优先使用本地 faster-whisper 离线识别（快、准、无网络依赖）；
-    不可用时回退到 Google 在线识别（含重试）。
+    优先使用 Google 在线识别（准确率高、支持多语言）；
+    Google 不可用（网络异常、超时）时回退到本地 faster-whisper 离线识别。
     audio_data 可以是 sr.AudioData 或 bytes（int16 PCM，16000Hz）。
     """
-    # ── faster-whisper 离线识别 ───────────────────────────────────────
+    # ── Google 在线识别（优先）───────────────────────────────────────
+    recognizer = sr.Recognizer()
+    MAX_RETRIES = 3
+    google_error = None
+    # bytes/bytearray 需先包装为 AudioData
+    if isinstance(audio_data, (bytes, bytearray)):
+        audio_for_google = sr.AudioData(audio_data, 16000, 2)
+    else:
+        audio_for_google = audio_data
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            text = recognizer.recognize_google(audio_for_google, language="zh-CN")
+            return text
+        except sr.UnknownValueError:
+            return ""   # 能连上但听不懂，不必重试
+        except sr.RequestError as e:
+            google_error = e
+            if attempt < MAX_RETRIES:
+                print(f"[语音] Google 识别出错（第{attempt}次，重试中）: {e}")
+                time.sleep(1)
+    print(f"[语音] Google 识别失败，切换到 faster-whisper 离线兜底: {google_error}")
+
+    # ── faster-whisper 离线识别（兜底）──────────────────────────────
     if WHISPER_AVAILABLE and _whisper_model is not None:
         try:
             if isinstance(audio_data, (bytes, bytearray)):
@@ -223,30 +245,16 @@ def _recognize(audio_data) -> str:
             segments, _ = _whisper_model.transcribe(
                 audio_np,
                 language="zh",
-                beam_size=3,       # 减小 beam_size 加快速度
-                vad_filter=True,   # 内置 VAD 过滤静音，减少误识别
+                beam_size=3,
+                vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 300},
             )
             text = "".join(seg.text for seg in segments).strip()
             return text
         except Exception as e:
-            print(f"[语音] faster-whisper 识别异常，回退 Google: {e}")
-
-    # ── Google 在线识别（回退）──────────────────────────────────────────
-    recognizer = sr.Recognizer()
-    MAX_RETRIES = 3
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            text = recognizer.recognize_google(audio_data, language="zh-CN")
-            return text
-        except sr.UnknownValueError:
-            return ""
-        except sr.RequestError as e:
-            if attempt < MAX_RETRIES:
-                print(f"[语音] Google 识别出错（第{attempt}次，重试中）: {e}")
-                time.sleep(1)
-            else:
-                raise
+            print(f"[语音] faster-whisper 识别异常: {e}")
+    else:
+        print("[语音] faster-whisper 不可用，识别失败")
     return ""
 
 
