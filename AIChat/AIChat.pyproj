@@ -40,6 +40,7 @@
     <Compile Include="AIChat\write_test.py" />
     <Compile Include="AIChat_Deepseek.py" />
     <Compile Include="AIChat_Doubao.py" />
+    <Compile Include="AIChat_Doubao_Audio_Stream.py" />
   </ItemGroup>
   <ItemGroup>
     <Folder Include="AIChat\" />

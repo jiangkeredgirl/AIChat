@@ -18,6 +18,7 @@ import sys, io, os, json, time, datetime, struct, math
 import threading, queue, uuid, hmac, hashlib, base64
 import wave, subprocess, tempfile
 import requests, pyaudio
+import numpy as _np
 
 # ── Windows UTF-8 ──────────────────────────────────────────────────────
 if sys.platform == "win32":
@@ -41,11 +42,18 @@ ACCESS_TOKEN = "ni5KWLvTq2efj7JfJHfXO9iUv8hcOHVu"
 SECRET_KEY   = "AUgB1kFRczyKxmbVnP0C6bjn9U9Mzix-"
 TTS_URL      = "https://openspeech.bytedance.com/api/v1/tts"
 TTS_CLUSTER  = "volcano_tts"          # SeedTTS2.0 实例集群
-TTS_VOICE    = "BV001_streaming"      # 女声；男声: BV700_streaming
+TTS_VOICE    = "温柔桃子"               # 使用“温柔桃子”音色
 TTS_RATE     = 24000                  # PCM 采样率
 
 # ── faster-whisper ASR ─────────────────────────────────────────────────
 WHISPER_MODEL_SIZE = "small"          # tiny / base / small / medium
+
+# ── Moonshine ASR（moonshine_voice）─────────────────────────────────────
+MOONSHINE_MODEL_SIZE = "base"         # tiny / base
+MOONSHINE_LANGUAGE   = "zh"
+
+# ── ASR 识别库选择：auto / doubao / whisper / moonshine ────────────────
+ASR_BACKEND = "auto"
 
 # ── 音频录音参数 ───────────────────────────────────────────────────────
 MIC_RATE        = 16000
@@ -65,12 +73,86 @@ EXIT_WORDS = {"退出", "再见", "结束", "拜拜", "quit", "exit", "bye"}
 print("[初始化] 加载 faster-whisper 模型...", flush=True)
 try:
     from faster_whisper import WhisperModel as _WhisperModel
-    import numpy as _np
     _whisper = _WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
     print(f"[初始化] faster-whisper {WHISPER_MODEL_SIZE} 加载完成")
 except Exception as e:
     _whisper = None
     print(f"[初始化] faster-whisper 加载失败: {e}")
+
+print("[初始化] 加载 Moonshine 模型...", flush=True)
+try:
+    from moonshine_voice import get_model_for_language as _ms_get_model_for_language
+    from moonshine_voice import ModelArch as _MSModelArch
+    from moonshine_voice.transcriber import Transcriber as _MSTranscriber
+
+    _ms_arch = _MSModelArch.BASE if MOONSHINE_MODEL_SIZE == "base" else _MSModelArch.TINY
+    _moonshine_model_path, _moonshine_model_arch = _ms_get_model_for_language(
+        MOONSHINE_LANGUAGE, _ms_arch
+    )
+    _moonshine = _MSTranscriber(
+        model_path=_moonshine_model_path,
+        model_arch=_moonshine_model_arch,
+    )
+    print(
+        f"[初始化] Moonshine {MOONSHINE_MODEL_SIZE}-{MOONSHINE_LANGUAGE} 加载完成",
+        flush=True,
+    )
+except Exception as e:
+    _moonshine = None
+    print(f"[初始化] Moonshine 加载失败: {e}")
+    print("[提示] 可运行: pip install moonshine-voice", flush=True)
+
+_VALID_ASR_BACKENDS = {"auto", "doubao", "whisper", "moonshine"}
+if ASR_BACKEND not in _VALID_ASR_BACKENDS:
+    print(f"[配置] ASR_BACKEND={ASR_BACKEND} 无效，已回退到 auto")
+    ASR_BACKEND = "auto"
+
+_SELECTED_ASR_BACKEND = ASR_BACKEND
+
+
+def _choose_asr_backend() -> str:
+    global _SELECTED_ASR_BACKEND
+    print("\nASR识别库选择：")
+    print("  1. 自动（豆包优先，失败后 moonshine，再 whisper）")
+    print("  2. 豆包流式ASR")
+    print("  3. Moonshine")
+    print("  4. faster-whisper")
+    c = input("选择ASR (1/2/3/4，回车按配置): ").strip()
+    mapping = {"1": "auto", "2": "doubao", "3": "moonshine", "4": "whisper"}
+    if c in mapping:
+        _SELECTED_ASR_BACKEND = mapping[c]
+    print(f"[ASR] 当前识别库: {_SELECTED_ASR_BACKEND}")
+    return _SELECTED_ASR_BACKEND
+
+
+def _asr_backend_available(name: str) -> bool:
+    if name == "doubao":
+        return WS_AVAILABLE
+    if name == "moonshine":
+        return _moonshine is not None
+    if name == "whisper":
+        return _whisper is not None
+    return True
+
+
+def _asr_fallback_order(name: str) -> list[str]:
+    if name == "doubao":
+        return ["doubao", "moonshine", "whisper"]
+    if name == "moonshine":
+        return ["moonshine", "doubao", "whisper"]
+    if name == "whisper":
+        return ["whisper", "doubao", "moonshine"]
+    return ["doubao", "moonshine", "whisper"]
+
+
+def _run_asr_backend(name: str, wav_bytes: bytes) -> str:
+    if name == "doubao":
+        return asr_doubao_stream(wav_bytes)
+    if name == "moonshine":
+        return asr_moonshine(wav_bytes)
+    if name == "whisper":
+        return asr_whisper(wav_bytes)
+    return ""
 
 try:
     import pyttsx3 as _pyttsx3
@@ -557,6 +639,23 @@ def asr_doubao_stream(wav_bytes: bytes) -> str:
 _cached_threshold: float = 0.0
 
 
+def asr_moonshine(wav_bytes: bytes) -> str:
+    """使用 Moonshine（moonshine_voice）识别 WAV 字节，返回文字。"""
+    if _moonshine is None:
+        return ""
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            frames = wf.readframes(wf.getnframes())
+            sample_rate = wf.getframerate()
+        audio_f32 = _np.frombuffer(frames, dtype=_np.int16).astype(_np.float32) / 32768.0
+        transcript = _moonshine.transcribe_without_streaming(audio_f32.tolist(), sample_rate=sample_rate)
+        lines = getattr(transcript, "lines", []) or []
+        return "".join((ln.text or "") for ln in lines).strip()
+    except Exception as e:
+        print(f"[ASR] Moonshine错误: {e}")
+        return ""
+
+
 def asr_whisper(wav_bytes: bytes) -> str:
     """使用 faster-whisper 识别 WAV 字节，返回文字。"""
     if _whisper is None:
@@ -576,14 +675,22 @@ def asr_whisper(wav_bytes: bytes) -> str:
 
 
 def asr_recognize(wav_bytes: bytes) -> str:
-    """ASR 统一入口：优先豆包BigModel流式ASR，无结果则用 faster-whisper 兜底。"""
-    text = asr_doubao_stream(wav_bytes)
-    if text:
-        return text
-    if _whisper is not None:
-        print("[ASR] 豆包ASR无结果，切换到 faster-whisper 兜底...", flush=True)
-        return asr_whisper(wav_bytes)
-    print("[ASR] 豆包ASR无结果且 faster-whisper 不可用", flush=True)
+    """ASR 统一入口：按当前选择的识别库执行，并自动尝试可用兜底。"""
+    backend = _SELECTED_ASR_BACKEND if _SELECTED_ASR_BACKEND in _VALID_ASR_BACKENDS else "auto"
+    tried = []
+    for name in _asr_fallback_order(backend):
+        if not _asr_backend_available(name):
+            continue
+        tried.append(name)
+        text = _run_asr_backend(name, wav_bytes)
+        if text:
+            return text
+        print(f"[ASR] {name} 无结果，尝试下一个...", flush=True)
+
+    if not tried:
+        print("[ASR] 当前无可用识别库（doubao/moonshine/whisper）", flush=True)
+    else:
+        print(f"[ASR] 已尝试 {', '.join(tried)}，均无结果", flush=True)
     return ""
 
 
@@ -786,7 +893,7 @@ def run_voice_mode():
                     print("[录音] 未检测到声音\n", flush=True); continue
                 consecutive_mic_fails = 0
 
-            # ── ASR 识别（豆包流式ASR → faster-whisper 兜底）─────────
+            # ── ASR 识别（按当前选择库 + 自动兜底）────────────────────
             print("🔍 识别中...", flush=True)
             text = asr_recognize(wav)
             if not text:
@@ -822,14 +929,15 @@ def main():
     print("=" * 60)
     print("   豆包 AI 聊天助手（端到端实时语音大模型）")
     print("   LLM : doubao-seed-2-0-pro-260215（流式SSE）")
-    print("   ASR : 豆包流式ASR BigModel（WebSocket二进制协议）")
+    print("   ASR : 可选 doubao / moonshine / faster-whisper")
     print("   TTS : 豆包 SeedTTS 2.0（HTTP + HMAC签名）")
-    print("   兜底: faster-whisper ASR / pyttsx3 TTS")
+    print("   兜底: pyttsx3 TTS")
     print("=" * 60)
     print("  1. 文字聊天（键盘输入 + 语音播报）")
     print("  2. 语音聊天（麦克风 + 语音播报，可随时打断）")
     print("  退出：Ctrl+C  /  说退出  /  输入退出")
     print("=" * 60)
+    _choose_asr_backend()
     c = input("选择模式 (1/2，回车默认文字): ").strip()
     if c == "2":
         run_voice_mode()
