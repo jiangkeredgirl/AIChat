@@ -15,6 +15,8 @@ if sys.platform == "win32":
 
 import json
 import datetime
+import base64
+import uuid
 import requests
 
 
@@ -22,6 +24,23 @@ import requests
 DEEPSEEK_API_KEY = "sk-892f8f3341d34354b8d245ade13d9269"
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL   = "deepseek-v4-pro"
+
+# ── 豆包 TTS（参考 doubao_tts_py-master HTTP）────────────────────────
+DOUBAO_TTS_ENABLED = os.getenv("DOUBAO_TTS_ENABLED", "1") == "1"
+DOUBAO_TTS_URL     = os.getenv("DOUBAO_TTS_URL", "https://openspeech.bytedance.com/api/v1/tts")
+DOUBAO_TTS_APP_ID  = os.getenv("DOUBAO_TTS_APP_ID", "9928059183")
+DOUBAO_TTS_TOKEN   = os.getenv("DOUBAO_TTS_TOKEN", "ni5KWLvTq2efj7JfJHfXO9iUv8hcOHVu")
+DOUBAO_TTS_CLUSTER = os.getenv("DOUBAO_TTS_CLUSTER", "volcano_tts")
+DOUBAO_TTS_VOICE   = os.getenv("DOUBAO_TTS_VOICE", "zh_female_meilinvyou_emo_v2_mars_bigtts")
+DOUBAO_TTS_RATE    = int(os.getenv("DOUBAO_TTS_RATE", "24000"))
+DOUBAO_TTS_ENCODING = "pcm"
+
+DOUBAO_TTS_AVAILABLE = bool(DOUBAO_TTS_ENABLED and DOUBAO_TTS_APP_ID and DOUBAO_TTS_TOKEN)
+if DOUBAO_TTS_ENABLED and not DOUBAO_TTS_AVAILABLE:
+    print("[提示] 豆包TTS配置不完整，将回退到本地 pyttsx3")
+if DOUBAO_TTS_AVAILABLE:
+    print(f"[语音] 豆包TTS已启用，音色: {DOUBAO_TTS_VOICE}")
+
 
 
 # ── 语音依赖（可选，未安装时自动降级为文字模式）──────────────────────────
@@ -185,6 +204,8 @@ except Exception as e:
     VOICE_OUTPUT_AVAILABLE = False
     print(f"[提示] pyttsx3 初始化失败: {e}，语音输出不可用。")
 
+if DOUBAO_TTS_AVAILABLE:
+    VOICE_OUTPUT_AVAILABLE = True
 
 
 # ── Whisper 离线语音识别模型（Google 在线识别失败时兜底）─────────────
@@ -406,6 +427,64 @@ def listen_from_microphone() -> str:
     return ""
 
 
+# ── 豆包 TTS（HTTP）───────────────────────────────────────────────────
+def _tts_doubao_http(text: str) -> bytes | None:
+    if not DOUBAO_TTS_AVAILABLE:
+        return None
+    body = {
+        "app": {
+            "appid": DOUBAO_TTS_APP_ID,
+            "token": DOUBAO_TTS_TOKEN,
+            "cluster": DOUBAO_TTS_CLUSTER,
+        },
+        "user": {"uid": "deepseek_user"},
+        "audio": {
+            "voice_type": DOUBAO_TTS_VOICE,
+            "encoding": DOUBAO_TTS_ENCODING,
+            "rate": DOUBAO_TTS_RATE,
+            "channel": 1,
+            "bits": 16,
+            "speed_ratio": 1.0,
+            "volume_ratio": 1.0,
+            "pitch_ratio": 1.0,
+        },
+        "request": {
+            "reqid": str(uuid.uuid4()),
+            "text": text,
+            "text_type": "plain",
+            "operation": "query",
+        },
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer;{DOUBAO_TTS_TOKEN}",
+    }
+    try:
+        resp = requests.post(DOUBAO_TTS_URL, headers=headers, json=body, timeout=20)
+        if resp.status_code != 200:
+            print(f"[TTS] 豆包HTTP {resp.status_code}: {resp.text[:160]}")
+            return None
+        data = resp.json()
+        if data.get("code") != 3000 or not data.get("data"):
+            print(f"[TTS] 豆包返回错误: {data}")
+            return None
+        return base64.b64decode(data["data"])
+    except Exception as e:
+        print(f"[TTS] 豆包请求失败: {e}")
+        return None
+
+
+def _play_pcm(pcm: bytes, rate: int):
+    pa = _pyaudio.PyAudio()
+    stream = pa.open(format=_pyaudio.paInt16, channels=1, rate=rate, output=True)
+    try:
+        stream.write(pcm)
+    finally:
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
+
+
 # ── 语音输出 ─────────────────────────────────────────────────────────
 def _build_tts_script(text: str) -> str:
     """构建 pyttsx3 子进程执行脚本"""
@@ -426,21 +505,214 @@ def _build_tts_script(text: str) -> str:
 
 def speak(text: str):
     """不可打断的语音播放（用于退出提示等简短语句）"""
+    if DOUBAO_TTS_AVAILABLE:
+        print(f"[TTS] 使用: 豆包HTTP ({DOUBAO_TTS_VOICE})", flush=True)
+        pcm = _tts_doubao_http(text)
+        if pcm:
+            try:
+                _play_pcm(pcm, DOUBAO_TTS_RATE)
+                return
+            except Exception as e:
+                print(f"[语音] 豆包TTS播放失败，回退pyttsx3: {e}")
+        else:
+            print("[TTS] 豆包TTS无可用音频，回退到 pyttsx3", flush=True)
+
     if not VOICE_OUTPUT_AVAILABLE:
+        print("[TTS] 不可用: 豆包与 pyttsx3 都不可用", flush=True)
         return
+
+    print("[TTS] 使用: pyttsx3", flush=True)
     proc = subprocess.Popen(
         [sys.executable, "-c", _build_tts_script(text)]
     )
     try:
-        proc.wait(timeout=8)   # 最多等 8 秒
+        proc.wait(timeout=8)
     except subprocess.TimeoutExpired:
-        proc.kill()            # 超时强制 kill，防止僵尸进程
+        proc.kill()
         try:
             proc.wait(timeout=2)
         except Exception:
             pass
     except Exception as e:
         print(f"[语音] 朗读失败: {e}")
+
+
+def _announce_tts_status(mode: str):
+    if mode in ("full", "text+voice"):
+        if DOUBAO_TTS_AVAILABLE:
+            print(f"[TTS] 当前优先: 豆包HTTP ({DOUBAO_TTS_VOICE})，失败回退 pyttsx3", flush=True)
+        elif VOICE_OUTPUT_AVAILABLE:
+            print("[TTS] 当前使用: pyttsx3", flush=True)
+        else:
+            print("[TTS] 当前状态: 不可用", flush=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def speak_interruptible(text: str) -> str:
+    """可打断的语音播放。
+
+    在语音输出的同时，通过 PyAudio 实时监测麦克风音量。
+    用户开口说话（音量超过阈值）时，立刻终止 TTS 子进程，
+    然后调用语音识别，将识别结果作为返回值返回。
+    未被打断则返回空字符串。
+    """
+    if not VOICE_OUTPUT_AVAILABLE:
+        return ""
+
+    print("[TTS] 使用: pyttsx3（可打断）", flush=True)
+    proc = subprocess.Popen([sys.executable, "-c", _build_tts_script(text)])
+    interrupted = threading.Event()
+    captured_audio = [None]   # 用列表传递跨线程的识别结果
+
+    def _vad_and_capture():
+        """VAD 监测 + 连续录音（回调模式，不阻塞）"""
+        if not VOICE_INPUT_AVAILABLE:
+            return
+        try:
+            import queue as _q, struct as _s, math as _m
+            RATE          = _MIC_NATIVE_RATE
+            CHUNK         = 1024
+            SAMPLE_WIDTH  = 2
+            VAD_THRESHOLD = 700
+            CONFIRM_FRAMES = 3
+            PRE_BUFFER_SEC = 1.0
+            PAUSE_SEC      = 2.5
+
+            pre_buf_max = int(RATE * PRE_BUFFER_SEC / CHUNK)
+            pause_max   = int(RATE * PAUSE_SEC / CHUNK)
+
+            audio_q = _q.Queue()
+
+            def _cb(in_data, frame_count, time_info, status, _aq=audio_q):
+                _aq.put(in_data)
+                return (None, _pyaudio.paContinue)
+
+            pa = _pyaudio.PyAudio()
+            stream = pa.open(
+                format=_pyaudio.paInt16, channels=1, rate=RATE,
+                input=True, input_device_index=_MIC_DEVICE_INDEX,
+                frames_per_buffer=CHUNK,
+                stream_callback=_cb,
+            )
+            stream.start_stream()
+
+            time.sleep(0.4)   # 防止扬声器声音触发 VAD
+
+            rolling     = []
+            consecutive = 0
+
+            # ── 阶段1：等待用户开口（TTS 播放期间）──────────────────────
+            while proc.poll() is None and not interrupted.is_set():
+                try:
+                    data = audio_q.get(timeout=0.1)
+                except _q.Empty:
+                    continue
+                rolling.append(data)
+                if len(rolling) > pre_buf_max:
+                    rolling.pop(0)
+                cnt    = len(data) // 2
+                shorts = _s.unpack(f"{cnt}h", data)
+                rms    = _m.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
+                if rms > VAD_THRESHOLD:
+                    consecutive += 1
+                    if consecutive >= CONFIRM_FRAMES:
+                        interrupted.set()
+                        break
+                else:
+                    consecutive = 0
+
+            if not interrupted.is_set():
+                stream.stop_stream(); stream.close(); pa.terminate()
+                return
+
+            # 终止 TTS 子进程
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+            print("\n[打断] 正在聆听...", flush=True)
+
+            # ── 阶段2：继续从回调队列录音，保留前1秒帧，直到静音 ────────
+            speech_frames = list(rolling)
+            silent        = 0
+            max_frames    = int(RATE * 60 / CHUNK)
+
+            while len(speech_frames) < max_frames:
+                try:
+                    data = audio_q.get(timeout=0.5)
+                except _q.Empty:
+                    break
+                speech_frames.append(data)
+                cnt    = len(data) // 2
+                shorts = _s.unpack(f"{cnt}h", data)
+                rms    = _m.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
+                if rms < VAD_THRESHOLD * 0.6:
+                    silent += 1
+                    if silent >= pause_max:
+                        break
+                else:
+                    silent = 0
+
+            stream.stop_stream(); stream.close(); pa.terminate()
+
+            # ── 识别 ─────────────────────────────────────────────────
+            raw        = b"".join(speech_frames)
+            audio_data = sr.AudioData(raw, RATE, SAMPLE_WIDTH)
+            print("🔍 识别中...", flush=True)
+            try:
+                text = _recognize(audio_data)
+                if text:
+                    print(f"你（语音）: {text}")
+                    captured_audio[0] = text
+                else:
+                    print("[语音] 未能识别，请重新说话。")
+                    captured_audio[0] = ""
+            except Exception as e:
+                print(f"[语音] 识别服务连接失败: {e}")
+                captured_audio[0] = ""
+
+        except Exception as e:
+            print(f"[语音] VAD 异常: {e}")
+
+    vad_thread = threading.Thread(target=_vad_and_capture, daemon=True)
+    vad_thread.start()
+
+    # 等待 TTS 播完或被打断
+    try:
+        proc.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+    interrupted.set()          # 通知 VAD 线程退出（若 TTS 已自然结束）
+    vad_thread.join(timeout=15)  # 等待识别完成
+
+    return captured_audio[0] or ""
 
 
 def speak_interruptible(text: str) -> str:
@@ -696,6 +968,7 @@ def main():
         "voice+text": "语音输入 + 文字输出",
     }
     print(f"\n当前模式：{mode_names.get(mode, mode)}")
+    _announce_tts_status(mode)
 
     now = datetime.datetime.now().strftime("%Y年%m月%d日 %H:%M:%S")
     system_prompt = (f"你是一个智能助手，当前时间是 {now}，"
@@ -780,6 +1053,7 @@ def main():
             use_voice_input  = mode in ("full", "voice+text")
             use_voice_output = mode in ("full", "text+voice")
             print(f"已切换到：{mode_names.get(mode, mode)}")
+            _announce_tts_status(mode)
             continue
 
         # ── 调用 AI ───────────────────────────────────────────────────
@@ -787,8 +1061,13 @@ def main():
             conversation_history, reply = chat(conversation_history, user_input)
             if use_voice_output and reply:
                 if use_voice_input:
-                    # 语音输入模式：支持打断，打断时捕获的文字直接用于下一轮
-                    interrupted_input = speak_interruptible(reply)
+                    if DOUBAO_TTS_AVAILABLE:
+                        print("[TTS] full模式: 走豆包HTTP播报（当前不支持打断）", flush=True)
+                        speak(reply)
+                        interrupted_input = ""
+                    else:
+                        # 语音输入模式：本地 pyttsx3 可打断，打断时捕获文字用于下一轮
+                        interrupted_input = speak_interruptible(reply)
                 else:
                     speak(reply)
         except Exception as e:
