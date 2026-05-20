@@ -1,7 +1,17 @@
+豆包ai大模型凭证：
 AccessKeyId: AKLTY2FkZTFjMzAwMjk3NDAyYjk0YmI4M2RiMWQyMTcwMTE
 SecretAccessKey: T0RGak5tRm1OMk5tWVRCa05HUXdZV0ppTTJWaE1EVXdNRE15TWpBMU5XRQ==
+豆包语音大模型凭证：
 aiaudiochat APP ID 9928059183
 API_KEY = "ark-ce45b71c-48f6-4b17-bf2d-95b41405ffff-7b27f"
 API_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 MODEL = "doubao-seed-2-0-pro-260215"  
+api-key 名称：
+api-key-20260518084751
+api-key：8fefb239-3181-4419-8b57-a2b95282c684
+
+火山方舟大模型服务凭证：
+名称:api-key-20260423154151
+API Key:ark-ce45b71c-48f6-4b17-bf2d-95b41405ffff-7b27f
+资源 ID:apikey-20260423154202-fgnxz
 

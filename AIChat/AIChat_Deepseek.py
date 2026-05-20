@@ -17,6 +17,13 @@ import json
 import datetime
 import requests
 
+
+# ── DeepSeek 配置 ────────────────────────────────────────────────────
+DEEPSEEK_API_KEY = "sk-892f8f3341d34354b8d245ade13d9269"
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL   = "deepseek-v4-pro"
+
+
 # ── 语音依赖（可选，未安装时自动降级为文字模式）──────────────────────────
 try:
     import speech_recognition as sr
@@ -178,14 +185,13 @@ except Exception as e:
     VOICE_OUTPUT_AVAILABLE = False
     print(f"[提示] pyttsx3 初始化失败: {e}，语音输出不可用。")
 
-# ── DeepSeek 配置 ────────────────────────────────────────────────────
-DEEPSEEK_API_KEY = "sk-892f8f3341d34354b8d245ade13d9269"
-DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
-DEEPSEEK_MODEL   = "deepseek-reasoner"
+
 
 # ── Whisper 离线语音识别模型（Google 在线识别失败时兜底）─────────────
 # 模型选项: tiny / base / small / medium / large-v3（越大越准，占用越多）
 WHISPER_MODEL_SIZE = "small"
+EXIT_WORDS = {"退出", "再见", "结束", "拜拜", "quit", "exit", "bye"}
+EXIT_EXACT_WORDS = {"quit", "exit", "退出"}
 try:
     from faster_whisper import WhisperModel as _WhisperModel
     import numpy as _np
@@ -709,7 +715,7 @@ def main():
         elif use_voice_input:
             user_input = ""
             consecutive_fails = 0
-            MAX_VOICE_FAILS   = 3
+            MAX_VOICE_FAILS   = 10000
             try:
                 while not user_input:
                     user_input = listen_from_microphone()
@@ -747,7 +753,8 @@ def main():
             continue
 
         # ── 内置命令 ──────────────────────────────────────────────────
-        if user_input.lower() in ("quit", "exit", "退出"):
+        normalized = user_input.lower()
+        if normalized in EXIT_EXACT_WORDS or any(w in user_input for w in EXIT_WORDS):
             print("再见！")
             if use_voice_output:
                 speak("再见")
