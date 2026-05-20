@@ -42,6 +42,53 @@ MIC_SAVE_ENABLED = os.getenv("MIC_SAVE_ENABLED", "1") == "1"
 MIC_SAVE_DIR = os.getenv("MIC_SAVE_DIR", "recordings")
 
 DOUBAO_TTS_AVAILABLE = bool(DOUBAO_TTS_ENABLED and DOUBAO_TTS_APP_ID and DOUBAO_TTS_TOKEN)
+
+
+def _ts() -> str:
+    return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+
+def _log_step(step: str):
+    print(f"[步骤] {_ts()} | {step}", flush=True)
+
+
+def _log_data(tag: str, data: str):
+    print(f"[{tag}] {_ts()} | {data}", flush=True)
+
+
+def _mask_secret(s: str, keep: int = 4) -> str:
+    if not s:
+        return ""
+    if len(s) <= keep:
+        return "*" * len(s)
+    return s[:keep] + "***"
+
+
+def _safe_json(obj) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return str(obj)
+
+
+def _sanitize_tts_body(body: dict) -> dict:
+    b = json.loads(json.dumps(body, ensure_ascii=False))
+    if "app" in b and isinstance(b["app"], dict):
+        b["app"]["token"] = _mask_secret(str(b["app"].get("token", "")))
+    return b
+
+
+def _sanitize_tts_resp_text(text: str) -> str:
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict) and "data" in obj and isinstance(obj["data"], str):
+            obj["data"] = f"<base64:{len(obj['data'])}>"
+        return _safe_json(obj)
+    except Exception:
+        return text
+
+
+
 if DOUBAO_TTS_ENABLED and not DOUBAO_TTS_AVAILABLE:
     print("[提示] 豆包TTS配置不完整，将回退到本地 pyttsx3")
 if DOUBAO_TTS_AVAILABLE:
@@ -384,6 +431,7 @@ def _save_input_wav(frames: list[bytes], rate: int, sample_width: int, tag: str)
             wf.setframerate(rate)
             wf.writeframes(b"".join(frames))
         print(f"[录音] 已保存: {path}", flush=True)
+        _log_step(f"语音文件保存完成: {path}")
         return path
     except Exception as e:
         print(f"[录音] 保存失败: {e}")
@@ -394,17 +442,20 @@ def _play_input_once(frames: list[bytes], rate: int):
     if not frames:
         return
     try:
+        _log_step("语音回放开始")
         pa = _pyaudio.PyAudio()
         out = pa.open(format=_pyaudio.paInt16, channels=1, rate=rate, output=True)
         out.write(b"".join(frames))
         out.stop_stream()
         out.close()
         pa.terminate()
+        _log_step("语音回放完成")
     except Exception as e:
         print(f"[语音] 输入回放失败: {e}")
 
 
 def _save_and_play_input_once(frames: list[bytes], rate: int, sample_width: int, tag: str):
+    _log_step("语音文件保存开始")
     _save_input_wav(frames, rate, sample_width, tag)
     _play_input_once(frames, rate)
 
@@ -531,9 +582,11 @@ def listen_from_microphone() -> str:
             # ── 识别 ─────────────────────────────────────────────────
             _save_and_play_input_once(frames, RATE, SAMPLE_WIDTH, "listen")
             print("🔍 识别中...", flush=True)
+            _log_step("语音识别开始")
             audio_data = sr.AudioData(b"".join(frames), RATE, SAMPLE_WIDTH)
             try:
                 text = _recognize(audio_data)
+                _log_step("语音识别完成")
                 if text:
                     print(f"你（语音）: {text}")
                     return text
@@ -599,8 +652,10 @@ def _tts_doubao_http(text: str) -> bytes | None:
         "Content-Type": "application/json",
         "Authorization": f"Bearer;{DOUBAO_TTS_TOKEN}",
     }
+    _log_step("TTS请求")
     try:
         resp = requests.post(DOUBAO_TTS_URL, headers=headers, json=body, timeout=20)
+        _log_data("TTS响应", _sanitize_tts_resp_text(resp.text))
         if resp.status_code != 200:
             print(f"[TTS] 豆包HTTP {resp.status_code}: {resp.text[:160]}")
             return None
@@ -645,12 +700,14 @@ def _build_tts_script(text: str) -> str:
 
 def speak(text: str):
     """不可打断的语音播放（用于退出提示等简短语句）"""
+    _log_step("TTS播放开始")
     if DOUBAO_TTS_AVAILABLE:
         print(f"[TTS] 使用: 豆包HTTP ({DOUBAO_TTS_VOICE})", flush=True)
         pcm = _tts_doubao_http(text)
         if pcm:
             try:
                 _play_pcm(pcm, DOUBAO_TTS_RATE)
+                _log_step("TTS播放完成")
                 return
             except Exception as e:
                 print(f"[语音] 豆包TTS播放失败，回退pyttsx3: {e}")
@@ -667,6 +724,7 @@ def speak(text: str):
     )
     try:
         proc.wait(timeout=8)
+        _log_step("TTS播放完成")
     except subprocess.TimeoutExpired:
         proc.kill()
         try:
@@ -821,7 +879,9 @@ def _capture_interrupt_speech(is_playing, stop_playback) -> str:
         raw = b"".join(speech_frames)
         audio_data = sr.AudioData(raw, RATE, SAMPLE_WIDTH)
         print("🔍 识别中...", flush=True)
+        _log_step("语音识别开始")
         text = _recognize(audio_data)
+        _log_step("语音识别完成")
         if text:
             print(f"你（语音）: {text}")
             return text
@@ -910,6 +970,7 @@ def speak_interruptible(text: str) -> str:
 def chat(conversation_history, user_input):
     """发送消息并流式获取 DeepSeek 回复"""
     conversation_history.append({"role": "user", "content": user_input})
+    _log_step("AI请求开始")
 
     headers = {
         "Content-Type": "application/json",
@@ -923,11 +984,13 @@ def chat(conversation_history, user_input):
 
     response = requests.post(DEEPSEEK_API_URL, headers=headers,
                              data=json.dumps(payload), stream=True)
+    _log_step("AI请求完成")
     if response.status_code != 200:
         raise Exception(f"HTTP {response.status_code}: {response.text}")
 
-    print("\nAI: ", end="", flush=True)
+    print(f"\n[{_ts()}] AI: ", end="", flush=True)
     full_reply = ""
+    _log_data("AI回复数据", "stream started")
     try:
         for line in response.iter_lines():
             if not line:
@@ -942,13 +1005,16 @@ def chat(conversation_history, user_input):
                 delta = chunk["choices"][0].get("delta", {})
                 content = delta.get("content", "")
                 if content:
+                    _log_data("AI回复数据", content)
                     print(content, end="", flush=True)
                     full_reply += content
             except json.JSONDecodeError:
+                _log_data("AI回复数据", text)
                 continue
     except Exception as e:
         print(f"\n[提示] 网络传输中断: {e}，已收到部分回复。", flush=True)
     print()
+    _log_step("AI回复完成")
 
     if full_reply:
         conversation_history.append({"role": "assistant", "content": full_reply})
@@ -1101,6 +1167,7 @@ def main():
             continue
 
         try:
+            _log_step("AI回复开始")
             conversation_history, reply = chat(conversation_history, user_input)
             if use_voice_output and reply:
                 if use_voice_input:
