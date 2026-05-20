@@ -17,6 +17,8 @@ import json
 import datetime
 import base64
 import uuid
+import wave
+from pathlib import Path
 import requests
 
 
@@ -34,6 +36,10 @@ DOUBAO_TTS_CLUSTER = os.getenv("DOUBAO_TTS_CLUSTER", "volcano_tts")
 DOUBAO_TTS_VOICE   = os.getenv("DOUBAO_TTS_VOICE", "zh_female_meilinvyou_emo_v2_mars_bigtts")
 DOUBAO_TTS_RATE    = int(os.getenv("DOUBAO_TTS_RATE", "24000"))
 DOUBAO_TTS_ENCODING = "pcm"
+
+MIC_MONITOR_ENABLED = os.getenv("MIC_MONITOR_ENABLED", "1") == "1"
+MIC_SAVE_ENABLED = os.getenv("MIC_SAVE_ENABLED", "1") == "1"
+MIC_SAVE_DIR = os.getenv("MIC_SAVE_DIR", "recordings")
 
 DOUBAO_TTS_AVAILABLE = bool(DOUBAO_TTS_ENABLED and DOUBAO_TTS_APP_ID and DOUBAO_TTS_TOKEN)
 if DOUBAO_TTS_ENABLED and not DOUBAO_TTS_AVAILABLE:
@@ -208,40 +214,98 @@ if DOUBAO_TTS_AVAILABLE:
     VOICE_OUTPUT_AVAILABLE = True
 
 
-# ── Whisper 离线语音识别模型（Google 在线识别失败时兜底）─────────────
-# 模型选项: tiny / base / small / medium / large-v3（越大越准，占用越多）
+# ── Moonshine / Whisper 语音识别模型──────────────────────────────────
+# Moonshine 模型选项: tiny / base
+MOONSHINE_MODEL_SIZE = os.getenv("MOONSHINE_MODEL_SIZE", "base")
+MOONSHINE_LANGUAGE = os.getenv("MOONSHINE_LANGUAGE", "zh")
+# Whisper 模型选项: tiny / base / small / medium / large-v3
 WHISPER_MODEL_SIZE = "small"
 EXIT_WORDS = {"退出", "再见", "结束", "拜拜", "quit", "exit", "bye"}
 EXIT_EXACT_WORDS = {"quit", "exit", "退出"}
+
+try:
+    import numpy as _np
+except Exception:
+    _np = None
+
+print("[语音] 正在加载 Moonshine 模型（优先识别）...", flush=True)
+try:
+    from moonshine_voice import get_model_for_language as _ms_get_model_for_language
+    from moonshine_voice import ModelArch as _MSModelArch
+    from moonshine_voice.transcriber import Transcriber as _MSTranscriber
+
+    _ms_arch = _MSModelArch.BASE if MOONSHINE_MODEL_SIZE == "base" else _MSModelArch.TINY
+    _moonshine_model_path, _moonshine_model_arch = _ms_get_model_for_language(
+        MOONSHINE_LANGUAGE, _ms_arch
+    )
+    _moonshine = _MSTranscriber(
+        model_path=_moonshine_model_path,
+        model_arch=_moonshine_model_arch,
+    )
+    MOONSHINE_AVAILABLE = _np is not None
+    if MOONSHINE_AVAILABLE:
+        print(f"[语音] Moonshine {MOONSHINE_MODEL_SIZE}-{MOONSHINE_LANGUAGE} 加载完成（优先）", flush=True)
+    else:
+        _moonshine = None
+        print("[提示] Moonshine 依赖 numpy 不可用，已跳过。可运行: pip install numpy", flush=True)
+except Exception as e:
+    MOONSHINE_AVAILABLE = False
+    _moonshine = None
+    print(f"[提示] Moonshine 加载失败: {e}，将回退到 Google/Whisper")
+    print("[提示] 可运行: pip install moonshine-voice", flush=True)
+
 try:
     from faster_whisper import WhisperModel as _WhisperModel
-    import numpy as _np
-    print(f"[语音] 正在加载 faster-whisper {WHISPER_MODEL_SIZE} 模型（Google 失败时兜底）...", flush=True)
+    print(f"[语音] 正在加载 faster-whisper {WHISPER_MODEL_SIZE} 模型（Moonshine/Google 失败时兜底）...", flush=True)
     _whisper_model = _WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
-    WHISPER_AVAILABLE = True
-    print(f"[语音] faster-whisper {WHISPER_MODEL_SIZE} 加载完成，作为 Google 识别的离线兜底")
+    WHISPER_AVAILABLE = _np is not None
+    if WHISPER_AVAILABLE:
+        print(f"[语音] faster-whisper {WHISPER_MODEL_SIZE} 加载完成")
+    else:
+        _whisper_model = None
+        print("[提示] faster-whisper 依赖 numpy 不可用，已禁用。可运行: pip install numpy")
 except ImportError:
     WHISPER_AVAILABLE = False
     _whisper_model = None
-    print("[提示] 未安装 faster-whisper，Google 识别失败时将无离线兜底。"
+    print("[提示] 未安装 faster-whisper，Moonshine/Google 失败时将无离线兜底。"
           "可运行: pip install faster-whisper")
 except Exception as e:
     WHISPER_AVAILABLE = False
     _whisper_model = None
-    print(f"[提示] faster-whisper 加载失败: {e}，Google 识别失败时将无离线兜底。")
+    print(f"[提示] faster-whisper 加载失败: {e}，Moonshine/Google 失败时将无离线兜底。")
+
+
+def _recognize_moonshine(audio_data) -> str:
+    if not MOONSHINE_AVAILABLE or _moonshine is None or _np is None:
+        return ""
+    try:
+        if isinstance(audio_data, (bytes, bytearray)):
+            raw_pcm = bytes(audio_data)
+            sample_rate = 16000
+        else:
+            raw_pcm = audio_data.get_raw_data(convert_rate=16000, convert_width=2)
+            sample_rate = 16000
+        audio_f32 = _np.frombuffer(raw_pcm, dtype=_np.int16).astype(_np.float32) / 32768.0
+        transcript = _moonshine.transcribe_without_streaming(audio_f32.tolist(), sample_rate=sample_rate)
+        lines = getattr(transcript, "lines", []) or []
+        return "".join((ln.text or "") for ln in lines).strip()
+    except Exception as e:
+        print(f"[语音] Moonshine 识别异常: {e}")
+        return ""
 
 
 def _recognize(audio_data) -> str:
-    """统一语音识别入口。
-    优先使用 Google 在线识别（准确率高、支持多语言）；
-    Google 不可用（网络异常、超时）时回退到本地 faster-whisper 离线识别。
-    audio_data 可以是 sr.AudioData 或 bytes（int16 PCM，16000Hz）。
-    """
-    # ── Google 在线识别（优先）───────────────────────────────────────
+    """统一语音识别入口：Moonshine 优先，失败后回退 Google，再回退 faster-whisper。"""
+    # ── Moonshine（优先）─────────────────────────────────────────────
+    text = _recognize_moonshine(audio_data)
+    if text:
+        print("[ASR] 使用: moonshine_voice", flush=True)
+        return text
+
+    # ── Google 在线识别（次优先）─────────────────────────────────────
     recognizer = sr.Recognizer()
     MAX_RETRIES = 3
     google_error = None
-    # bytes/bytearray 需先包装为 AudioData
     if isinstance(audio_data, (bytes, bytearray)):
         audio_for_google = sr.AudioData(audio_data, 16000, 2)
     else:
@@ -249,9 +313,11 @@ def _recognize(audio_data) -> str:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             text = recognizer.recognize_google(audio_for_google, language="zh-CN")
+            if text:
+                print("[ASR] 使用: Google", flush=True)
             return text
         except sr.UnknownValueError:
-            return ""   # 能连上但听不懂，不必重试
+            break
         except sr.RequestError as e:
             google_error = e
             if attempt < MAX_RETRIES:
@@ -260,7 +326,7 @@ def _recognize(audio_data) -> str:
     print(f"[语音] Google 识别失败，切换到 faster-whisper 离线兜底: {google_error}")
 
     # ── faster-whisper 离线识别（兜底）──────────────────────────────
-    if WHISPER_AVAILABLE and _whisper_model is not None:
+    if WHISPER_AVAILABLE and _whisper_model is not None and _np is not None:
         try:
             if isinstance(audio_data, (bytes, bytearray)):
                 raw_pcm = audio_data
@@ -275,12 +341,51 @@ def _recognize(audio_data) -> str:
                 vad_parameters={"min_silence_duration_ms": 300},
             )
             text = "".join(seg.text for seg in segments).strip()
+            if text:
+                print("[ASR] 使用: faster-whisper", flush=True)
             return text
         except Exception as e:
             print(f"[语音] faster-whisper 识别异常: {e}")
     else:
         print("[语音] faster-whisper 不可用，识别失败")
     return ""
+
+
+def _open_monitor_output(pa, rate: int):
+    if not MIC_MONITOR_ENABLED:
+        return None
+    try:
+        return pa.open(format=_pyaudio.paInt16, channels=1, rate=rate, output=True)
+    except Exception as e:
+        print(f"[语音] 输入监听播放不可用: {e}")
+        return None
+
+
+def _monitor_chunk(out_stream, chunk: bytes):
+    if out_stream is None:
+        return
+    try:
+        out_stream.write(chunk)
+    except Exception:
+        pass
+
+
+def _save_input_wav(frames: list[bytes], rate: int, sample_width: int, tag: str):
+    if not MIC_SAVE_ENABLED or not frames:
+        return
+    try:
+        save_dir = Path(MIC_SAVE_DIR)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = save_dir / f"{tag}_{ts}.wav"
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(sample_width)
+            wf.setframerate(rate)
+            wf.writeframes(b"".join(frames))
+        print(f"[录音] 已保存: {path}", flush=True)
+    except Exception as e:
+        print(f"[录音] 保存失败: {e}")
 
 
 def listen_from_microphone() -> str:
@@ -310,6 +415,7 @@ def listen_from_microphone() -> str:
 
         pa     = _pyaudio.PyAudio()
         stream = None
+        monitor_stream = None
         try:
             stream = pa.open(
                 format=_pyaudio.paInt16,
@@ -321,6 +427,7 @@ def listen_from_microphone() -> str:
                 stream_callback=_cb,
             )
             stream.start_stream()
+            monitor_stream = _open_monitor_output(pa, RATE)
         except Exception as e:
             print(f"[麦克风] 设备 {dev_idx} 打开失败: {e}", flush=True)
             if stream:
@@ -340,7 +447,9 @@ def listen_from_microphone() -> str:
             cal_target = max(1, int(RATE * 0.5 / CHUNK))
             while len(cal) < cal_target and time.time() < cal_deadline:
                 try:
-                    cal.append(audio_q.get(timeout=0.2))
+                    d = audio_q.get(timeout=0.2)
+                    cal.append(d)
+                    _monitor_chunk(monitor_stream, d)
                 except _queue.Empty:
                     pass
 
@@ -363,6 +472,7 @@ def listen_from_microphone() -> str:
                     chunk = audio_q.get(timeout=0.1)
                 except _queue.Empty:
                     continue
+                _monitor_chunk(monitor_stream, chunk)
                 cnt    = len(chunk) // 2
                 shorts = _struct.unpack(f"{cnt}h", chunk)
                 rms    = _math.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
@@ -385,6 +495,7 @@ def listen_from_microphone() -> str:
                 except _queue.Empty:
                     break
                 frames.append(chunk)
+                _monitor_chunk(monitor_stream, chunk)
                 cnt    = len(chunk) // 2
                 shorts = _struct.unpack(f"{cnt}h", chunk)
                 rms    = _math.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
@@ -396,6 +507,7 @@ def listen_from_microphone() -> str:
                     silence_cnt = 0
 
             # ── 识别 ─────────────────────────────────────────────────
+            _save_input_wav(frames, RATE, SAMPLE_WIDTH, "listen")
             print("🔍 识别中...", flush=True)
             audio_data = sr.AudioData(b"".join(frames), RATE, SAMPLE_WIDTH)
             try:
@@ -416,6 +528,12 @@ def listen_from_microphone() -> str:
             print(f"[麦克风] 设备 {dev_idx} 运行异常: {e}", flush=True)
             continue
         finally:
+            try:
+                if monitor_stream:
+                    monitor_stream.stop_stream()
+                    monitor_stream.close()
+            except Exception:
+                pass
             try:
                 stream.stop_stream()
                 stream.close()
@@ -597,6 +715,7 @@ def _capture_interrupt_speech(is_playing, stop_playback) -> str:
             return (None, _pyaudio.paContinue)
 
         pa = _pyaudio.PyAudio()
+        monitor_stream = _open_monitor_output(pa, RATE)
         stream = pa.open(
             format=_pyaudio.paInt16, channels=1, rate=RATE,
             input=True, input_device_index=_MIC_DEVICE_INDEX,
@@ -617,6 +736,7 @@ def _capture_interrupt_speech(is_playing, stop_playback) -> str:
             except _q.Empty:
                 continue
             rolling.append(data)
+            _monitor_chunk(monitor_stream, data)
             if len(rolling) > pre_buf_max:
                 rolling.pop(0)
             cnt = len(data) // 2
@@ -633,6 +753,12 @@ def _capture_interrupt_speech(is_playing, stop_playback) -> str:
                 consecutive = 0
 
         if not interrupted:
+            try:
+                if monitor_stream:
+                    monitor_stream.stop_stream()
+                    monitor_stream.close()
+            except Exception:
+                pass
             stream.stop_stream(); stream.close(); pa.terminate()
             return ""
 
@@ -649,6 +775,7 @@ def _capture_interrupt_speech(is_playing, stop_playback) -> str:
             except _q.Empty:
                 break
             speech_frames.append(data)
+            _monitor_chunk(monitor_stream, data)
             cnt = len(data) // 2
             shorts = _s.unpack(f"{cnt}h", data)
             rms = _m.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
@@ -659,6 +786,13 @@ def _capture_interrupt_speech(is_playing, stop_playback) -> str:
             else:
                 silent = 0
 
+        _save_input_wav(speech_frames, RATE, SAMPLE_WIDTH, "interrupt")
+        try:
+            if monitor_stream:
+                monitor_stream.stop_stream()
+                monitor_stream.close()
+        except Exception:
+            pass
         stream.stop_stream(); stream.close(); pa.terminate()
 
         raw = b"".join(speech_frames)
