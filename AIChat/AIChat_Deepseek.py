@@ -571,295 +571,185 @@ def _announce_tts_status(mode: str):
 
 
 
-def speak_interruptible(text: str) -> str:
-    """可打断的语音播放。
+def _capture_interrupt_speech(is_playing, stop_playback) -> str:
+    """监听打断并在打断后采集语音，返回识别文本。"""
+    if not VOICE_INPUT_AVAILABLE:
+        return ""
+    try:
+        import queue as _q, struct as _s, math as _m
+        RATE           = _MIC_NATIVE_RATE
+        CHUNK          = 1024
+        SAMPLE_WIDTH   = 2
+        VAD_THRESHOLD  = 900
+        CONFIRM_FRAMES = 3
+        PRE_BUFFER_SEC = 1.0
+        PAUSE_SEC      = 2.5
+        ARM_DELAY_SEC  = 0.35
+        _arm_time      = time.time() + ARM_DELAY_SEC
 
-    在语音输出的同时，通过 PyAudio 实时监测麦克风音量。
-    用户开口说话（音量超过阈值）时，立刻终止 TTS 子进程，
-    然后调用语音识别，将识别结果作为返回值返回。
-    未被打断则返回空字符串。
-    """
+        pre_buf_max = int(RATE * PRE_BUFFER_SEC / CHUNK)
+        pause_max   = int(RATE * PAUSE_SEC / CHUNK)
+
+        audio_q = _q.Queue()
+
+        def _cb(in_data, frame_count, time_info, status, _aq=audio_q):
+            _aq.put(in_data)
+            return (None, _pyaudio.paContinue)
+
+        pa = _pyaudio.PyAudio()
+        stream = pa.open(
+            format=_pyaudio.paInt16, channels=1, rate=RATE,
+            input=True, input_device_index=_MIC_DEVICE_INDEX,
+            frames_per_buffer=CHUNK,
+            stream_callback=_cb,
+        )
+        stream.start_stream()
+
+        time.sleep(0.4)
+
+        rolling = []
+        consecutive = 0
+        interrupted = False
+
+        while is_playing():
+            try:
+                data = audio_q.get(timeout=0.1)
+            except _q.Empty:
+                continue
+            rolling.append(data)
+            if len(rolling) > pre_buf_max:
+                rolling.pop(0)
+            cnt = len(data) // 2
+            shorts = _s.unpack(f"{cnt}h", data)
+            rms = _m.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
+            if time.time() < _arm_time:
+                continue
+            if rms > VAD_THRESHOLD:
+                consecutive += 1
+                if consecutive >= CONFIRM_FRAMES:
+                    interrupted = True
+                    break
+            else:
+                consecutive = 0
+
+        if not interrupted:
+            stream.stop_stream(); stream.close(); pa.terminate()
+            return ""
+
+        stop_playback()
+        print("\n[打断] 正在聆听...", flush=True)
+
+        speech_frames = list(rolling)
+        silent = 0
+        max_frames = int(RATE * 60 / CHUNK)
+
+        while len(speech_frames) < max_frames:
+            try:
+                data = audio_q.get(timeout=0.5)
+            except _q.Empty:
+                break
+            speech_frames.append(data)
+            cnt = len(data) // 2
+            shorts = _s.unpack(f"{cnt}h", data)
+            rms = _m.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
+            if rms < VAD_THRESHOLD * 0.6:
+                silent += 1
+                if silent >= pause_max:
+                    break
+            else:
+                silent = 0
+
+        stream.stop_stream(); stream.close(); pa.terminate()
+
+        raw = b"".join(speech_frames)
+        audio_data = sr.AudioData(raw, RATE, SAMPLE_WIDTH)
+        print("🔍 识别中...", flush=True)
+        text = _recognize(audio_data)
+        if text:
+            print(f"你（语音）: {text}")
+            return text
+        print("[语音] 未能识别，请重新说话。")
+        return ""
+    except Exception as e:
+        print(f"[语音] 打断监听异常: {e}")
+        return ""
+
+
+def speak_interruptible(text: str) -> str:
+    """可打断的语音播放（豆包HTTP优先，失败回退 pyttsx3）。"""
     if not VOICE_OUTPUT_AVAILABLE:
         return ""
+
+    if DOUBAO_TTS_AVAILABLE:
+        pcm = _tts_doubao_http(text)
+        if pcm:
+            print(f"[TTS] 使用: 豆包HTTP（可打断）({DOUBAO_TTS_VOICE})", flush=True)
+
+            class _Player:
+                def __init__(self, data: bytes, rate: int):
+                    self._data = data
+                    self._rate = rate
+                    self._stop = threading.Event()
+                    self._done = threading.Event()
+                    self._t = threading.Thread(target=self._run, daemon=True)
+
+                def _run(self):
+                    pa = _pyaudio.PyAudio()
+                    stream = pa.open(format=_pyaudio.paInt16, channels=1, rate=self._rate, output=True)
+                    pos, chunk = 0, 4096
+                    try:
+                        while pos < len(self._data) and not self._stop.is_set():
+                            stream.write(self._data[pos:pos + chunk])
+                            pos += chunk
+                    finally:
+                        stream.stop_stream(); stream.close(); pa.terminate()
+                        self._done.set()
+
+                def start(self):
+                    self._t.start()
+
+                def interrupt(self):
+                    self._stop.set()
+
+                def is_playing(self):
+                    return self._t.is_alive() and not self._done.is_set()
+
+                def wait(self, timeout=None):
+                    self._done.wait(timeout)
+
+            player = _Player(pcm, DOUBAO_TTS_RATE)
+            player.start()
+            time.sleep(0.25)
+            captured = _capture_interrupt_speech(player.is_playing, player.interrupt)
+            player.wait(timeout=120)
+            return captured
+        print("[TTS] 豆包TTS无可用音频，回退到 pyttsx3（可打断）", flush=True)
 
     print("[TTS] 使用: pyttsx3（可打断）", flush=True)
     proc = subprocess.Popen([sys.executable, "-c", _build_tts_script(text)])
-    interrupted = threading.Event()
-    captured_audio = [None]   # 用列表传递跨线程的识别结果
 
-    def _vad_and_capture():
-        """VAD 监测 + 连续录音（回调模式，不阻塞）"""
-        if not VOICE_INPUT_AVAILABLE:
-            return
-        try:
-            import queue as _q, struct as _s, math as _m
-            RATE          = _MIC_NATIVE_RATE
-            CHUNK         = 1024
-            SAMPLE_WIDTH  = 2
-            VAD_THRESHOLD = 700
-            CONFIRM_FRAMES = 3
-            PRE_BUFFER_SEC = 1.0
-            PAUSE_SEC      = 2.5
+    def _is_playing():
+        return proc.poll() is None
 
-            pre_buf_max = int(RATE * PRE_BUFFER_SEC / CHUNK)
-            pause_max   = int(RATE * PAUSE_SEC / CHUNK)
-
-            audio_q = _q.Queue()
-
-            def _cb(in_data, frame_count, time_info, status, _aq=audio_q):
-                _aq.put(in_data)
-                return (None, _pyaudio.paContinue)
-
-            pa = _pyaudio.PyAudio()
-            stream = pa.open(
-                format=_pyaudio.paInt16, channels=1, rate=RATE,
-                input=True, input_device_index=_MIC_DEVICE_INDEX,
-                frames_per_buffer=CHUNK,
-                stream_callback=_cb,
-            )
-            stream.start_stream()
-
-            time.sleep(0.4)   # 防止扬声器声音触发 VAD
-
-            rolling     = []
-            consecutive = 0
-
-            # ── 阶段1：等待用户开口（TTS 播放期间）──────────────────────
-            while proc.poll() is None and not interrupted.is_set():
-                try:
-                    data = audio_q.get(timeout=0.1)
-                except _q.Empty:
-                    continue
-                rolling.append(data)
-                if len(rolling) > pre_buf_max:
-                    rolling.pop(0)
-                cnt    = len(data) // 2
-                shorts = _s.unpack(f"{cnt}h", data)
-                rms    = _m.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
-                if rms > VAD_THRESHOLD:
-                    consecutive += 1
-                    if consecutive >= CONFIRM_FRAMES:
-                        interrupted.set()
-                        break
-                else:
-                    consecutive = 0
-
-            if not interrupted.is_set():
-                stream.stop_stream(); stream.close(); pa.terminate()
-                return
-
-            # 终止 TTS 子进程
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-
-            print("\n[打断] 正在聆听...", flush=True)
-
-            # ── 阶段2：继续从回调队列录音，保留前1秒帧，直到静音 ────────
-            speech_frames = list(rolling)
-            silent        = 0
-            max_frames    = int(RATE * 60 / CHUNK)
-
-            while len(speech_frames) < max_frames:
-                try:
-                    data = audio_q.get(timeout=0.5)
-                except _q.Empty:
-                    break
-                speech_frames.append(data)
-                cnt    = len(data) // 2
-                shorts = _s.unpack(f"{cnt}h", data)
-                rms    = _m.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
-                if rms < VAD_THRESHOLD * 0.6:
-                    silent += 1
-                    if silent >= pause_max:
-                        break
-                else:
-                    silent = 0
-
-            stream.stop_stream(); stream.close(); pa.terminate()
-
-            # ── 识别 ─────────────────────────────────────────────────
-            raw        = b"".join(speech_frames)
-            audio_data = sr.AudioData(raw, RATE, SAMPLE_WIDTH)
-            print("🔍 识别中...", flush=True)
+    def _stop_playback():
+        if proc.poll() is None:
+            proc.terminate()
             try:
-                text = _recognize(audio_data)
-                if text:
-                    print(f"你（语音）: {text}")
-                    captured_audio[0] = text
-                else:
-                    print("[语音] 未能识别，请重新说话。")
-                    captured_audio[0] = ""
-            except Exception as e:
-                print(f"[语音] 识别服务连接失败: {e}")
-                captured_audio[0] = ""
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
-        except Exception as e:
-            print(f"[语音] VAD 异常: {e}")
-
-    vad_thread = threading.Thread(target=_vad_and_capture, daemon=True)
-    vad_thread.start()
-
-    # 等待 TTS 播完或被打断
+    captured = _capture_interrupt_speech(_is_playing, _stop_playback)
     try:
         proc.wait(timeout=120)
     except subprocess.TimeoutExpired:
         proc.kill()
-
-    interrupted.set()          # 通知 VAD 线程退出（若 TTS 已自然结束）
-    vad_thread.join(timeout=15)  # 等待识别完成
-
-    return captured_audio[0] or ""
-
-
-def speak_interruptible(text: str) -> str:
-    """可打断的语音播放。
-
-    在语音输出的同时，通过 PyAudio 实时监测麦克风音量。
-    用户开口说话（音量超过阈值）时，立刻终止 TTS 子进程，
-    然后调用语音识别，将识别结果作为返回值返回。
-    未被打断则返回空字符串。
-    """
-    if not VOICE_OUTPUT_AVAILABLE:
-        return ""
-
-    proc = subprocess.Popen([sys.executable, "-c", _build_tts_script(text)])
-    interrupted = threading.Event()
-    captured_audio = [None]   # 用列表传递跨线程的识别结果
-
-    def _vad_and_capture():
-        """VAD 监测 + 连续录音（回调模式，不阻塞）"""
-        if not VOICE_INPUT_AVAILABLE:
-            return
-        try:
-            import queue as _q, struct as _s, math as _m
-            RATE          = _MIC_NATIVE_RATE
-            CHUNK         = 1024
-            SAMPLE_WIDTH  = 2
-            VAD_THRESHOLD = 700
-            CONFIRM_FRAMES = 3
-            PRE_BUFFER_SEC = 1.0
-            PAUSE_SEC      = 2.5
-
-            pre_buf_max = int(RATE * PRE_BUFFER_SEC / CHUNK)
-            pause_max   = int(RATE * PAUSE_SEC / CHUNK)
-
-            audio_q = _q.Queue()
-
-            def _cb(in_data, frame_count, time_info, status, _aq=audio_q):
-                _aq.put(in_data)
-                return (None, _pyaudio.paContinue)
-
-            pa = _pyaudio.PyAudio()
-            stream = pa.open(
-                format=_pyaudio.paInt16, channels=1, rate=RATE,
-                input=True, input_device_index=_MIC_DEVICE_INDEX,
-                frames_per_buffer=CHUNK,
-                stream_callback=_cb,
-            )
-            stream.start_stream()
-
-            time.sleep(0.4)   # 防止扬声器声音触发 VAD
-
-            rolling     = []
-            consecutive = 0
-
-            # ── 阶段1：等待用户开口（TTS 播放期间）──────────────────────
-            while proc.poll() is None and not interrupted.is_set():
-                try:
-                    data = audio_q.get(timeout=0.1)
-                except _q.Empty:
-                    continue
-                rolling.append(data)
-                if len(rolling) > pre_buf_max:
-                    rolling.pop(0)
-                cnt    = len(data) // 2
-                shorts = _s.unpack(f"{cnt}h", data)
-                rms    = _m.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
-                if rms > VAD_THRESHOLD:
-                    consecutive += 1
-                    if consecutive >= CONFIRM_FRAMES:
-                        interrupted.set()
-                        break
-                else:
-                    consecutive = 0
-
-            if not interrupted.is_set():
-                stream.stop_stream(); stream.close(); pa.terminate()
-                return
-
-            # 终止 TTS 子进程
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-
-            print("\n[打断] 正在聆听...", flush=True)
-
-            # ── 阶段2：继续从回调队列录音，保留前1秒帧，直到静音 ────────
-            speech_frames = list(rolling)
-            silent        = 0
-            max_frames    = int(RATE * 60 / CHUNK)
-
-            while len(speech_frames) < max_frames:
-                try:
-                    data = audio_q.get(timeout=0.5)
-                except _q.Empty:
-                    break
-                speech_frames.append(data)
-                cnt    = len(data) // 2
-                shorts = _s.unpack(f"{cnt}h", data)
-                rms    = _m.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
-                if rms < VAD_THRESHOLD * 0.6:
-                    silent += 1
-                    if silent >= pause_max:
-                        break
-                else:
-                    silent = 0
-
-            stream.stop_stream(); stream.close(); pa.terminate()
-
-            # ── 识别 ─────────────────────────────────────────────────
-            raw        = b"".join(speech_frames)
-            audio_data = sr.AudioData(raw, RATE, SAMPLE_WIDTH)
-            print("🔍 识别中...", flush=True)
-            try:
-                text = _recognize(audio_data)
-                if text:
-                    print(f"你（语音）: {text}")
-                    captured_audio[0] = text
-                else:
-                    print("[语音] 未能识别，请重新说话。")
-                    captured_audio[0] = ""
-            except Exception as e:
-                print(f"[语音] 识别服务连接失败: {e}")
-                captured_audio[0] = ""
-
-        except Exception as e:
-            print(f"[语音] VAD 异常: {e}")
-
-    vad_thread = threading.Thread(target=_vad_and_capture, daemon=True)
-    vad_thread.start()
-
-    # 等待 TTS 播完或被打断
-    try:
-        proc.wait(timeout=120)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-
-    interrupted.set()          # 通知 VAD 线程退出（若 TTS 已自然结束）
-    vad_thread.join(timeout=15)  # 等待识别完成
-
-    return captured_audio[0] or ""
+    return captured
 
 
 
 # ── AI 聊天（流式） ───────────────────────────────────────────────────
+
 def chat(conversation_history, user_input):
     """发送消息并流式获取 DeepSeek 回复"""
     conversation_history.append({"role": "user", "content": user_input})
@@ -900,8 +790,6 @@ def chat(conversation_history, user_input):
             except json.JSONDecodeError:
                 continue
     except Exception as e:
-        # 网络中断（IncompleteRead、ChunkedEncodingError 等）
-        # 已收到的内容保留，仅提示用户
         print(f"\n[提示] 网络传输中断: {e}，已收到部分回复。", flush=True)
     print()
 
@@ -921,8 +809,8 @@ def choose_mode() -> str:
       'full'       语音输入 + 语音播报
     """
     print("\n请选择聊天模式：")
-    print(f"  [当前状态] 语音输入: {'\u2705 可用' if VOICE_INPUT_AVAILABLE else '\u274c 不可用'}  "
-          f"语音播报: {'\u2705 可用' if VOICE_OUTPUT_AVAILABLE else '\u274c 不可用'}")
+    print(f"  [当前状态] 语音输入: {'✅ 可用' if VOICE_INPUT_AVAILABLE else '❌ 不可用'}  "
+          f"语音播报: {'✅ 可用' if VOICE_OUTPUT_AVAILABLE else '❌ 不可用'}")
     print("  1. 纯文字（默认）")
     if VOICE_INPUT_AVAILABLE and VOICE_OUTPUT_AVAILABLE:
         print("  2. 纯语音（语音输入 + 语音播报）")
@@ -977,12 +865,10 @@ def main():
 
     use_voice_input  = mode in ("full", "voice+text")
     use_voice_output = mode in ("full", "text+voice")
-    interrupted_input: str = ""   # 打断 TTS 时捕获的语音文字
+    interrupted_input: str = ""
 
     while True:
-        # ── 获取用户输入 ──────────────────────────────────────────────
         if interrupted_input:
-            # 上一轮 TTS 被打断，直接使用打断时识别到的文字
             user_input = interrupted_input
             interrupted_input = ""
         elif use_voice_input:
@@ -995,25 +881,25 @@ def main():
                     if not user_input:
                         consecutive_fails += 1
                         if consecutive_fails >= MAX_VOICE_FAILS:
-                            print(f"[\u8bed\u97f3] \u8fde\u7eed {MAX_VOICE_FAILS} \u6b21\u65e0\u6cd5\u5f55\u97f3/\u8bc6\u522b\uff0c"
-                                  "\u5207\u6362\u4e3a\u6587\u5b57\u8f93\u5165\u6a21\u5f0f", flush=True)
+                            print(f"[语音] 连续 {MAX_VOICE_FAILS} 次无法录音/识别，"
+                                  "切换为文字输入模式", flush=True)
                             try:
-                                user_input = input("\n\u4f60(\u6587\u5b57): ").strip()
+                                user_input = input("\n你(文字): ").strip()
                             except (KeyboardInterrupt, EOFError):
                                 raise
                             break
                         if mode == "full":
-                            print(f"[\u8bed\u97f3] \u91cd\u8bd5 ({consecutive_fails}/{MAX_VOICE_FAILS})...",
+                            print(f"[语音] 重试 ({consecutive_fails}/{MAX_VOICE_FAILS})...",
                                   flush=True)
                         else:
-                            retry = input("\u672a\u8bc6\u522b\u5230\u8bed\u97f3\uff0c\u6309 Enter \u91cd\u8bd5\uff0c\u6216\u8f93\u5165\u6587\u5b57: ").strip()
+                            retry = input("未识别到语音，按 Enter 重试，或输入文字: ").strip()
                             if retry:
                                 user_input = retry
                                 break
                     else:
                         consecutive_fails = 0
             except (KeyboardInterrupt, EOFError):
-                print("\n\n\u518d\u89c1\uff01")
+                print("\n\n再见！")
                 break
         else:
             try:
@@ -1025,7 +911,6 @@ def main():
         if not user_input:
             continue
 
-        # ── 内置命令 ──────────────────────────────────────────────────
         normalized = user_input.lower()
         if normalized in EXIT_EXACT_WORDS or any(w in user_input for w in EXIT_WORDS):
             print("再见！")
@@ -1056,18 +941,11 @@ def main():
             _announce_tts_status(mode)
             continue
 
-        # ── 调用 AI ───────────────────────────────────────────────────
         try:
             conversation_history, reply = chat(conversation_history, user_input)
             if use_voice_output and reply:
                 if use_voice_input:
-                    if DOUBAO_TTS_AVAILABLE:
-                        print("[TTS] full模式: 走豆包HTTP播报（当前不支持打断）", flush=True)
-                        speak(reply)
-                        interrupted_input = ""
-                    else:
-                        # 语音输入模式：本地 pyttsx3 可打断，打断时捕获文字用于下一轮
-                        interrupted_input = speak_interruptible(reply)
+                    interrupted_input = speak_interruptible(reply)
                 else:
                     speak(reply)
         except Exception as e:
@@ -1076,4 +954,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
