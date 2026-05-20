@@ -372,7 +372,7 @@ def _monitor_chunk(out_stream, chunk: bytes):
 
 def _save_input_wav(frames: list[bytes], rate: int, sample_width: int, tag: str):
     if not MIC_SAVE_ENABLED or not frames:
-        return
+        return None
     try:
         save_dir = Path(MIC_SAVE_DIR)
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -384,8 +384,29 @@ def _save_input_wav(frames: list[bytes], rate: int, sample_width: int, tag: str)
             wf.setframerate(rate)
             wf.writeframes(b"".join(frames))
         print(f"[录音] 已保存: {path}", flush=True)
+        return path
     except Exception as e:
         print(f"[录音] 保存失败: {e}")
+        return None
+
+
+def _play_input_once(frames: list[bytes], rate: int):
+    if not frames:
+        return
+    try:
+        pa = _pyaudio.PyAudio()
+        out = pa.open(format=_pyaudio.paInt16, channels=1, rate=rate, output=True)
+        out.write(b"".join(frames))
+        out.stop_stream()
+        out.close()
+        pa.terminate()
+    except Exception as e:
+        print(f"[语音] 输入回放失败: {e}")
+
+
+def _save_and_play_input_once(frames: list[bytes], rate: int, sample_width: int, tag: str):
+    _save_input_wav(frames, rate, sample_width, tag)
+    _play_input_once(frames, rate)
 
 
 def listen_from_microphone() -> str:
@@ -427,7 +448,8 @@ def listen_from_microphone() -> str:
                 stream_callback=_cb,
             )
             stream.start_stream()
-            monitor_stream = _open_monitor_output(pa, RATE)
+            monitor_stream = None
+            # monitor_stream = _open_monitor_output(pa, RATE)  # 已按需求注释：边录边播
         except Exception as e:
             print(f"[麦克风] 设备 {dev_idx} 打开失败: {e}", flush=True)
             if stream:
@@ -449,7 +471,7 @@ def listen_from_microphone() -> str:
                 try:
                     d = audio_q.get(timeout=0.2)
                     cal.append(d)
-                    _monitor_chunk(monitor_stream, d)
+                    # _monitor_chunk(monitor_stream, d)  # 已按需求注释：边录边播
                 except _queue.Empty:
                     pass
 
@@ -472,7 +494,7 @@ def listen_from_microphone() -> str:
                     chunk = audio_q.get(timeout=0.1)
                 except _queue.Empty:
                     continue
-                _monitor_chunk(monitor_stream, chunk)
+                # _monitor_chunk(monitor_stream, chunk)  # 已按需求注释：边录边播
                 cnt    = len(chunk) // 2
                 shorts = _struct.unpack(f"{cnt}h", chunk)
                 rms    = _math.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
@@ -495,7 +517,7 @@ def listen_from_microphone() -> str:
                 except _queue.Empty:
                     break
                 frames.append(chunk)
-                _monitor_chunk(monitor_stream, chunk)
+                # _monitor_chunk(monitor_stream, chunk)  # 已按需求注释：边录边播
                 cnt    = len(chunk) // 2
                 shorts = _struct.unpack(f"{cnt}h", chunk)
                 rms    = _math.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
@@ -507,7 +529,7 @@ def listen_from_microphone() -> str:
                     silence_cnt = 0
 
             # ── 识别 ─────────────────────────────────────────────────
-            _save_input_wav(frames, RATE, SAMPLE_WIDTH, "listen")
+            _save_and_play_input_once(frames, RATE, SAMPLE_WIDTH, "listen")
             print("🔍 识别中...", flush=True)
             audio_data = sr.AudioData(b"".join(frames), RATE, SAMPLE_WIDTH)
             try:
@@ -715,7 +737,8 @@ def _capture_interrupt_speech(is_playing, stop_playback) -> str:
             return (None, _pyaudio.paContinue)
 
         pa = _pyaudio.PyAudio()
-        monitor_stream = _open_monitor_output(pa, RATE)
+        monitor_stream = None
+        # monitor_stream = _open_monitor_output(pa, RATE)  # 已按需求注释：边录边播
         stream = pa.open(
             format=_pyaudio.paInt16, channels=1, rate=RATE,
             input=True, input_device_index=_MIC_DEVICE_INDEX,
@@ -736,7 +759,7 @@ def _capture_interrupt_speech(is_playing, stop_playback) -> str:
             except _q.Empty:
                 continue
             rolling.append(data)
-            _monitor_chunk(monitor_stream, data)
+            # _monitor_chunk(monitor_stream, data)  # 已按需求注释：边录边播
             if len(rolling) > pre_buf_max:
                 rolling.pop(0)
             cnt = len(data) // 2
@@ -775,7 +798,7 @@ def _capture_interrupt_speech(is_playing, stop_playback) -> str:
             except _q.Empty:
                 break
             speech_frames.append(data)
-            _monitor_chunk(monitor_stream, data)
+            # _monitor_chunk(monitor_stream, data)  # 已按需求注释：边录边播
             cnt = len(data) // 2
             shorts = _s.unpack(f"{cnt}h", data)
             rms = _m.sqrt(sum(s * s for s in shorts) / cnt) if cnt else 0
@@ -786,7 +809,7 @@ def _capture_interrupt_speech(is_playing, stop_playback) -> str:
             else:
                 silent = 0
 
-        _save_input_wav(speech_frames, RATE, SAMPLE_WIDTH, "interrupt")
+        _save_and_play_input_once(speech_frames, RATE, SAMPLE_WIDTH, "interrupt")
         try:
             if monitor_stream:
                 monitor_stream.stop_stream()
@@ -991,6 +1014,8 @@ def main():
     }
     print(f"\n当前模式：{mode_names.get(mode, mode)}")
     _announce_tts_status(mode)
+    if mode == "full" and VOICE_OUTPUT_AVAILABLE:
+        speak("我们开始聊天吧")
 
     now = datetime.datetime.now().strftime("%Y年%m月%d日 %H:%M:%S")
     system_prompt = (f"你是一个智能助手，当前时间是 {now}，"
