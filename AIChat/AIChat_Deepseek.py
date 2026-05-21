@@ -49,7 +49,7 @@ def _ts() -> str:
 
 
 def _log_step(step: str):
-    print(f"[步骤] {_ts()} | {step}", flush=True)
+    print(f"[{_ts()}] {step}", flush=True)
 
 
 def _log_data(tag: str, data: str):
@@ -655,7 +655,7 @@ def _tts_doubao_http(text: str) -> bytes | None:
     _log_step("TTS请求")
     try:
         resp = requests.post(DOUBAO_TTS_URL, headers=headers, json=body, timeout=20)
-        _log_data("TTS响应", _sanitize_tts_resp_text(resp.text))
+        print(f"[TTS响应] {_ts()}", flush=True)
         if resp.status_code != 200:
             print(f"[TTS] 豆包HTTP {resp.status_code}: {resp.text[:160]}")
             return None
@@ -990,7 +990,6 @@ def chat(conversation_history, user_input):
 
     print(f"\n[{_ts()}] AI: ", end="", flush=True)
     full_reply = ""
-    _log_data("AI回复数据", "stream started")
     try:
         for line in response.iter_lines():
             if not line:
@@ -1005,11 +1004,9 @@ def chat(conversation_history, user_input):
                 delta = chunk["choices"][0].get("delta", {})
                 content = delta.get("content", "")
                 if content:
-                    _log_data("AI回复数据", content)
                     print(content, end="", flush=True)
                     full_reply += content
             except json.JSONDecodeError:
-                _log_data("AI回复数据", text)
                 continue
     except Exception as e:
         print(f"\n[提示] 网络传输中断: {e}，已收到部分回复。", flush=True)
