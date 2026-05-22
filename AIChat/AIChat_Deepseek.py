@@ -261,7 +261,9 @@ if DOUBAO_TTS_AVAILABLE:
     VOICE_OUTPUT_AVAILABLE = True
 
 
-# ── Moonshine / Whisper 语音识别模型──────────────────────────────────
+# ── Qwen3-ASR / Moonshine / Whisper 语音识别模型──────────────────────
+QWEN3_ASR_ENABLED = os.getenv("QWEN3_ASR_ENABLED", "1") == "1"
+QWEN3_ASR_MODEL = os.getenv("QWEN3_ASR_MODEL", "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch")
 # Moonshine 模型选项: tiny / base
 MOONSHINE_MODEL_SIZE = os.getenv("MOONSHINE_MODEL_SIZE", "base")
 MOONSHINE_LANGUAGE = os.getenv("MOONSHINE_LANGUAGE", "zh")
@@ -275,7 +277,28 @@ try:
 except Exception:
     _np = None
 
-print("[语音] 正在加载 Moonshine 模型（优先识别）...", flush=True)
+if QWEN3_ASR_ENABLED:
+    print("[语音] 正在加载 Qwen3-ASR 模型（优先识别）...", flush=True)
+try:
+    if QWEN3_ASR_ENABLED:
+        from funasr import AutoModel as _FunASRAutoModel
+        _qwen3_asr_model = _FunASRAutoModel(model=QWEN3_ASR_MODEL)
+        QWEN3_ASR_AVAILABLE = _np is not None
+        if QWEN3_ASR_AVAILABLE:
+            print(f"[语音] Qwen3-ASR 加载完成: {QWEN3_ASR_MODEL}", flush=True)
+        else:
+            _qwen3_asr_model = None
+            print("[提示] Qwen3-ASR 依赖 numpy 不可用，已禁用。可运行: pip install numpy", flush=True)
+    else:
+        QWEN3_ASR_AVAILABLE = False
+        _qwen3_asr_model = None
+except Exception as e:
+    QWEN3_ASR_AVAILABLE = False
+    _qwen3_asr_model = None
+    print(f"[提示] Qwen3-ASR 加载失败: {e}，将回退到 Moonshine/Google/Whisper", flush=True)
+    print("[提示] 可运行: pip install funasr", flush=True)
+
+print("[语音] 正在加载 Moonshine 模型（次优先识别）...", flush=True)
 try:
     from moonshine_voice import get_model_for_language as _ms_get_model_for_language
     from moonshine_voice import ModelArch as _MSModelArch
@@ -322,6 +345,29 @@ except Exception as e:
     print(f"[提示] faster-whisper 加载失败: {e}，Moonshine/Google 失败时将无离线兜底。")
 
 
+def _recognize_qwen3_asr(audio_data) -> str:
+    if not QWEN3_ASR_AVAILABLE or _qwen3_asr_model is None or _np is None:
+        return ""
+    try:
+        if isinstance(audio_data, (bytes, bytearray)):
+            raw_pcm = bytes(audio_data)
+        else:
+            raw_pcm = audio_data.get_raw_data(convert_rate=16000, convert_width=2)
+        audio_f32 = _np.frombuffer(raw_pcm, dtype=_np.int16).astype(_np.float32) / 32768.0
+        result = _qwen3_asr_model.generate(input=audio_f32, sampling_rate=16000)
+        if isinstance(result, list) and result:
+            first = result[0]
+            if isinstance(first, dict):
+                return str(first.get("text", "")).strip()
+            return str(first).strip()
+        if isinstance(result, dict):
+            return str(result.get("text", "")).strip()
+        return str(result).strip() if result else ""
+    except Exception as e:
+        print(f"[语音] Qwen3-ASR 识别异常: {e}")
+        return ""
+
+
 def _recognize_moonshine(audio_data) -> str:
     if not MOONSHINE_AVAILABLE or _moonshine is None or _np is None:
         return ""
@@ -342,14 +388,20 @@ def _recognize_moonshine(audio_data) -> str:
 
 
 def _recognize(audio_data) -> str:
-    """统一语音识别入口：Moonshine 优先，失败后回退 Google，再回退 faster-whisper。"""
-    # ── Moonshine（优先）─────────────────────────────────────────────
+    """统一语音识别入口：Qwen3-ASR 优先，失败后回退 Moonshine、Google、faster-whisper。"""
+    # ── Qwen3-ASR（最高优先）────────────────────────────────────────
+    text = _recognize_qwen3_asr(audio_data)
+    if text:
+        print("[ASR] 使用: Qwen3-ASR", flush=True)
+        return text
+
+    # ── Moonshine（次优先）───────────────────────────────────────────
     text = _recognize_moonshine(audio_data)
     if text:
         print("[ASR] 使用: moonshine_voice", flush=True)
         return text
 
-    # ── Google 在线识别（次优先）─────────────────────────────────────
+    # ── Google 在线识别（再次优先）──────────────────────────────────
     recognizer = sr.Recognizer()
     MAX_RETRIES = 3
     google_error = None
@@ -396,7 +448,6 @@ def _recognize(audio_data) -> str:
     else:
         print("[语音] faster-whisper 不可用，识别失败")
     return ""
-
 
 def _open_monitor_output(pa, rate: int):
     if not MIC_MONITOR_ENABLED:
