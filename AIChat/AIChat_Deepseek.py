@@ -269,8 +269,19 @@ MOONSHINE_MODEL_SIZE = os.getenv("MOONSHINE_MODEL_SIZE", "base")
 MOONSHINE_LANGUAGE = os.getenv("MOONSHINE_LANGUAGE", "zh")
 # Whisper 模型选项: tiny / base / small / medium / large-v3
 WHISPER_MODEL_SIZE = "small"
-EXIT_WORDS = {"退出", "再见", "结束", "拜拜", "quit", "exit", "bye"}
+EXIT_WORDS = {
+    "退出", "退出程序", "关闭程序", "关闭聊天", "关闭对话",
+    "再见", "结束", "拜拜", "quit", "exit", "bye",
+}
 EXIT_EXACT_WORDS = {"quit", "exit", "退出"}
+
+
+def _normalize_command_text(text: str) -> str:
+    t = (text or "").lower().strip()
+    t = "".join(t.split())
+    for ch in "，。！？、,.!?;；:：\"'“”‘’（）()[]【】{}<>《》-—_":
+        t = t.replace(ch, "")
+    return t
 
 try:
     import numpy as _np
@@ -1184,8 +1195,8 @@ def main():
         if not user_input:
             continue
 
-        normalized = user_input.lower()
-        if normalized in EXIT_EXACT_WORDS or any(w in user_input for w in EXIT_WORDS):
+        normalized = _normalize_command_text(user_input)
+        if normalized in EXIT_EXACT_WORDS or any(w in normalized for w in EXIT_WORDS):
             print("再见！")
             if use_voice_output:
                 speak("再见")
