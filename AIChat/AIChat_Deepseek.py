@@ -283,6 +283,58 @@ def _normalize_command_text(text: str) -> str:
         t = t.replace(ch, "")
     return t
 
+
+def _open_netease_cloudmusic() -> tuple[bool, str]:
+    candidates = [
+        r"C:\Program Files (x86)\Netease\CloudMusic\cloudmusic.exe",
+        r"C:\Program Files\Netease\CloudMusic\cloudmusic.exe",
+        r"%LOCALAPPDATA%\Programs\Netease\CloudMusic\cloudmusic.exe",
+    ]
+
+    for raw_path in candidates:
+        exe_path = os.path.expandvars(raw_path)
+        if os.path.exists(exe_path):
+            try:
+                os.startfile(exe_path)
+                return True, exe_path
+            except Exception:
+                pass
+
+    try:
+        subprocess.Popen(["cmd", "/c", "start", "", "orpheus://"], shell=False)
+        return True, "orpheus://"
+    except Exception:
+        pass
+
+    return False, ""
+
+
+def _open_notepadpp() -> tuple[bool, str]:
+    candidates = [
+        r"D:\Program\Notepad++\notepad++.exe",
+        r"C:\Program Files\Notepad++\notepad++.exe",
+        r"C:\Program Files (x86)\Notepad++\notepad++.exe",
+        r"%LOCALAPPDATA%\Programs\Notepad++\notepad++.exe",
+    ]
+
+    for raw_path in candidates:
+        exe_path = os.path.expandvars(raw_path)
+        if os.path.exists(exe_path):
+            try:
+                os.startfile(exe_path)
+                return True, exe_path
+            except Exception:
+                pass
+
+    try:
+        subprocess.Popen(["notepad++"], shell=False)
+        return True, "notepad++"
+    except Exception:
+        pass
+
+    return False, ""
+
+
 try:
     import numpy as _np
 except Exception:
@@ -1201,6 +1253,34 @@ def main():
             if use_voice_output:
                 speak("再见")
             break
+
+        if "打开网易云音乐" in user_input or "打开网易云音乐" in normalized:
+            ok, opened = _open_netease_cloudmusic()
+            if ok:
+                msg = "已为你打开网易云音乐。"
+                print(msg)
+                if use_voice_output:
+                    speak(msg)
+            else:
+                msg = "未找到网易云音乐，请先确认已安装。"
+                print(msg)
+                if use_voice_output:
+                    speak(msg)
+            continue
+
+        if "打开notepad" in normalized or "opennotepad" in normalized:
+            ok, opened = _open_notepadpp()
+            if ok:
+                msg = "已为你打开 Notepad++。"
+                print(msg)
+                if use_voice_output:
+                    speak(msg)
+            else:
+                msg = "未找到 Notepad++，请先确认已安装。"
+                print(msg)
+                if use_voice_output:
+                    speak(msg)
+            continue
 
         if user_input.lower() in ("clear", "清除"):
             conversation_history = [{"role": "system", "content": system_prompt}]
