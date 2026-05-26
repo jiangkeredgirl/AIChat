@@ -25,7 +25,7 @@ import requests
 # ── DeepSeek 配置 ────────────────────────────────────────────────────
 DEEPSEEK_API_KEY = "sk-892f8f3341d34354b8d245ade13d9269"
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
-DEEPSEEK_MODEL   = "deepseek-v4-pro"
+DEEPSEEK_MODEL   = "deepseek-v4-flash"
 
 # ── 豆包 TTS（参考 doubao_tts_py-master HTTP）────────────────────────
 DOUBAO_TTS_ENABLED = os.getenv("DOUBAO_TTS_ENABLED", "1") == "1"
@@ -1094,6 +1094,7 @@ def chat(conversation_history, user_input):
         "model": DEEPSEEK_MODEL,
         "messages": conversation_history,
         "stream": True,
+        "thinking": {"type": "disabled"},
     }
 
     response = requests.post(DEEPSEEK_API_URL, headers=headers,
