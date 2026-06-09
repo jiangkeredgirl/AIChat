@@ -1080,10 +1080,45 @@ def speak_interruptible(text: str) -> str:
 
 
 # ── AI 聊天（流式） ───────────────────────────────────────────────────
+MAX_CONTEXT_MESSAGES = 12
+MAX_MESSAGE_CHARS = 1200
+
+
+def _trim_message_text(text: str) -> str:
+    text = (text or "").strip()
+    if len(text) <= MAX_MESSAGE_CHARS:
+        return text
+    half = MAX_MESSAGE_CHARS // 2
+    return f"{text[:half]}\n...[已截断 {len(text) - MAX_MESSAGE_CHARS} 字符]...\n{text[-half:]}"
+
+
+def _build_messages_for_request(conversation_history: list[dict]) -> list[dict]:
+    if not conversation_history:
+        return []
+    system_msg = conversation_history[0] if conversation_history[0].get("role") == "system" else None
+    non_system = [m for m in conversation_history if m.get("role") != "system"]
+    recent = non_system[-MAX_CONTEXT_MESSAGES:]
+
+    messages = []
+    if system_msg:
+        messages.append({"role": "system", "content": _trim_message_text(system_msg.get("content", ""))})
+    for msg in recent:
+        messages.append({"role": msg.get("role", "user"), "content": _trim_message_text(msg.get("content", ""))})
+    return messages
+
+
+def _print_request_messages(messages: list[dict]):
+    merged = "\n\n".join(f"[{m.get('role', 'user')}]\n{m.get('content', '')}" for m in messages)
+    print("\n[发送给AI的字符串开始]", flush=True)
+    print(merged, flush=True)
+    print("[发送给AI的字符串结束]\n", flush=True)
+
 
 def chat(conversation_history, user_input):
     """发送消息并流式获取 DeepSeek 回复"""
     conversation_history.append({"role": "user", "content": user_input})
+    messages_for_request = _build_messages_for_request(conversation_history)
+    _print_request_messages(messages_for_request)
     _log_step("AI请求开始")
 
     headers = {
@@ -1092,7 +1127,7 @@ def chat(conversation_history, user_input):
     }
     payload = {
         "model": DEEPSEEK_MODEL,
-        "messages": conversation_history,
+        "messages": messages_for_request,
         "stream": True,
         "thinking": {"type": "disabled"},
     }
