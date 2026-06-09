@@ -1,0 +1,1 @@
+npm exec betahi-copilot-bridge@latest -- start --port 4142 --account-type individual
