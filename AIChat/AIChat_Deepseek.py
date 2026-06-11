@@ -19,6 +19,8 @@ import base64
 import uuid
 import wave
 from pathlib import Path
+from collections import deque
+from difflib import SequenceMatcher
 import requests
 
 
@@ -1080,8 +1082,14 @@ def speak_interruptible(text: str) -> str:
 
 
 # ── AI 聊天（流式） ───────────────────────────────────────────────────
-MAX_CONTEXT_MESSAGES = 12
-MAX_MESSAGE_CHARS = 1200
+MAX_CONTEXT_MESSAGES = 6
+MAX_MESSAGE_CHARS = 500
+MAX_REQUEST_CHARS = 2200
+MAX_RESPONSE_TOKENS = 220
+
+TTS_INPUT_COOLDOWN_SECONDS = 2.0
+SIMILARITY_BLOCK_THRESHOLD = 0.86
+REQUESTS_PER_MINUTE_LIMIT = 8
 
 
 def _trim_message_text(text: str) -> str:
@@ -1100,10 +1108,22 @@ def _build_messages_for_request(conversation_history: list[dict]) -> list[dict]:
     recent = non_system[-MAX_CONTEXT_MESSAGES:]
 
     messages = []
+    total_chars = 0
+
     if system_msg:
-        messages.append({"role": "system", "content": _trim_message_text(system_msg.get("content", ""))})
-    for msg in recent:
-        messages.append({"role": msg.get("role", "user"), "content": _trim_message_text(msg.get("content", ""))})
+        sys_text = _trim_message_text(system_msg.get("content", ""))
+        messages.append({"role": "system", "content": sys_text})
+        total_chars += len(sys_text)
+
+    selected = []
+    for msg in reversed(recent):
+        content = _trim_message_text(msg.get("content", ""))
+        if total_chars + len(content) > MAX_REQUEST_CHARS:
+            continue
+        selected.append({"role": msg.get("role", "user"), "content": content})
+        total_chars += len(content)
+
+    messages.extend(reversed(selected))
     return messages
 
 
@@ -1112,6 +1132,24 @@ def _print_request_messages(messages: list[dict]):
     print("\n[发送给AI的字符串开始]", flush=True)
     print(merged, flush=True)
     print("[发送给AI的字符串结束]\n", flush=True)
+
+
+def _text_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _prune_request_times(request_times: deque, now_ts: float):
+    while request_times and (now_ts - request_times[0]) > 60:
+        request_times.popleft()
+
+
+def _can_send_request(request_times: deque) -> tuple[bool, int]:
+    now_ts = time.time()
+    _prune_request_times(request_times, now_ts)
+    remaining = REQUESTS_PER_MINUTE_LIMIT - len(request_times)
+    return remaining > 0, max(0, remaining)
 
 
 def chat(conversation_history, user_input):
@@ -1129,6 +1167,7 @@ def chat(conversation_history, user_input):
         "model": DEEPSEEK_MODEL,
         "messages": messages_for_request,
         "stream": True,
+        "max_tokens": MAX_RESPONSE_TOKENS,
         "thinking": {"type": "disabled"},
     }
 
@@ -1238,6 +1277,9 @@ def main():
     use_voice_input  = mode in ("full", "voice+text")
     use_voice_output = mode in ("full", "text+voice")
     interrupted_input: str = ""
+    last_ai_reply_for_echo_filter: str = ""
+    tts_cooldown_until = 0.0
+    request_times = deque()
 
     while True:
         if interrupted_input:
@@ -1249,7 +1291,20 @@ def main():
             MAX_VOICE_FAILS   = 10000
             try:
                 while not user_input:
+                    now_ts = time.time()
+                    if now_ts < tts_cooldown_until:
+                        wait_sec = max(0.0, tts_cooldown_until - now_ts)
+                        print(f"[防自激] 播报后冷却中，{wait_sec:.1f}s 后恢复收音", flush=True)
+                        time.sleep(min(0.5, wait_sec))
+                        continue
+
                     user_input = listen_from_microphone()
+                    if user_input and last_ai_reply_for_echo_filter:
+                        similarity = _text_similarity(user_input, last_ai_reply_for_echo_filter)
+                        if similarity >= SIMILARITY_BLOCK_THRESHOLD:
+                            print(f"[防自激] 忽略疑似回声输入（相似度 {similarity:.2f}）", flush=True)
+                            user_input = ""
+
                     if not user_input:
                         consecutive_fails += 1
                         if consecutive_fails >= MAX_VOICE_FAILS:
@@ -1341,12 +1396,20 @@ def main():
             _announce_tts_status(mode)
             continue
 
+        can_send, remaining = _can_send_request(request_times)
+        if not can_send:
+            print("[限流] 60秒内请求次数已达上限，请稍后再试。", flush=True)
+            continue
+
         try:
             _log_step("AI回复开始")
             conversation_history, reply = chat(conversation_history, user_input)
+            request_times.append(time.time())
+            last_ai_reply_for_echo_filter = reply or ""
             if use_voice_output and reply:
                 if use_voice_input:
                     interrupted_input = speak_interruptible(reply)
+                    tts_cooldown_until = time.time() + TTS_INPUT_COOLDOWN_SECONDS
                 else:
                     speak(reply)
         except Exception as e:
