@@ -885,7 +885,7 @@ def _announce_tts_status(mode: str):
 
 
 
-def _capture_interrupt_speech(is_playing, stop_playback) -> str:
+def _capture_interrupt_speech(is_playing, stop_playback, playback_text: str = "", last_ai_reply: str = "") -> str:
     """监听打断并在打断后采集语音，返回识别文本。"""
     if not VOICE_INPUT_AVAILABLE:
         return ""
@@ -898,6 +898,9 @@ def _capture_interrupt_speech(is_playing, stop_playback) -> str:
         CONFIRM_FRAMES = 3
         PRE_BUFFER_SEC = 1.0
         PAUSE_SEC      = 2.5
+        ECHO_MATCH_THRESHOLD = 0.72
+        SHORT_ECHO_THRESHOLD = 0.55
+        SHORT_ECHO_LEN = 12
         ARM_DELAY_SEC  = 0.35
         _arm_time      = time.time() + ARM_DELAY_SEC
 
@@ -999,6 +1002,19 @@ def _capture_interrupt_speech(is_playing, stop_playback) -> str:
         text = _recognize(audio_data)
         _log_step("语音识别完成")
         if text:
+            echo_ref = last_ai_reply or playback_text
+            if echo_ref:
+                normalized_text = _normalize_for_echo(text)
+                normalized_echo = _normalize_for_echo(echo_ref)
+                similarity = _text_similarity(normalized_text, normalized_echo)
+                short_text_echo = (
+                    len(normalized_text) <= SHORT_ECHO_LEN
+                    and normalized_text
+                    and normalized_text in normalized_echo
+                )
+                if similarity >= ECHO_MATCH_THRESHOLD or (short_text_echo and similarity >= SHORT_ECHO_THRESHOLD):
+                    print(f"[防自激] 打断语音判定为回音并丢弃（相似度 {similarity:.2f}）", flush=True)
+                    return ""
             print(f"你（语音）: {text}")
             return text
         print("[语音] 未能识别，请重新说话。")
@@ -1053,7 +1069,12 @@ def speak_interruptible(text: str) -> str:
             player = _Player(pcm, DOUBAO_TTS_RATE)
             player.start()
             time.sleep(0.25)
-            captured = _capture_interrupt_speech(player.is_playing, player.interrupt)
+            captured = _capture_interrupt_speech(
+                player.is_playing,
+                player.interrupt,
+                playback_text=text,
+                last_ai_reply=text,
+            )
             player.wait(timeout=120)
             return captured
         print("[TTS] 豆包TTS无可用音频，回退到 pyttsx3（可打断）", flush=True)
@@ -1072,7 +1093,12 @@ def speak_interruptible(text: str) -> str:
             except subprocess.TimeoutExpired:
                 proc.kill()
 
-    captured = _capture_interrupt_speech(_is_playing, _stop_playback)
+    captured = _capture_interrupt_speech(
+        _is_playing,
+        _stop_playback,
+        playback_text=text,
+        last_ai_reply=text,
+    )
     try:
         proc.wait(timeout=120)
     except subprocess.TimeoutExpired:
@@ -1082,14 +1108,21 @@ def speak_interruptible(text: str) -> str:
 
 
 # ── AI 聊天（流式） ───────────────────────────────────────────────────
-MAX_CONTEXT_MESSAGES = 6
-MAX_MESSAGE_CHARS = 500
-MAX_REQUEST_CHARS = 2200
-MAX_RESPONSE_TOKENS = 220
+MAX_CONTEXT_MESSAGES = 2
+MAX_MESSAGE_CHARS = 180
+MAX_REQUEST_CHARS = 500
+MAX_REQUEST_JSON_CHARS = 2500
+MAX_RESPONSE_TOKENS = 120
+INCLUDE_ASSISTANT_HISTORY = False
+INCLUDE_SYSTEM_MESSAGE = True
 
 TTS_INPUT_COOLDOWN_SECONDS = 2.0
+INTERRUPTED_INPUT_COOLDOWN_SECONDS = 1.5
 SIMILARITY_BLOCK_THRESHOLD = 0.86
 REQUESTS_PER_MINUTE_LIMIT = 8
+MIN_REQUEST_INTERVAL_SECONDS = 3.0
+DUPLICATE_INPUT_WINDOW_SECONDS = 10.0
+MAX_REQUESTS_PER_SESSION = 60
 
 
 def _trim_message_text(text: str) -> str:
@@ -1103,14 +1136,19 @@ def _trim_message_text(text: str) -> str:
 def _build_messages_for_request(conversation_history: list[dict]) -> list[dict]:
     if not conversation_history:
         return []
+
     system_msg = conversation_history[0] if conversation_history[0].get("role") == "system" else None
     non_system = [m for m in conversation_history if m.get("role") != "system"]
+
+    if not INCLUDE_ASSISTANT_HISTORY:
+        non_system = [m for m in non_system if m.get("role") == "user"]
+
     recent = non_system[-MAX_CONTEXT_MESSAGES:]
 
     messages = []
     total_chars = 0
 
-    if system_msg:
+    if INCLUDE_SYSTEM_MESSAGE and system_msg:
         sys_text = _trim_message_text(system_msg.get("content", ""))
         messages.append({"role": "system", "content": sys_text})
         total_chars += len(sys_text)
@@ -1134,10 +1172,66 @@ def _print_request_messages(messages: list[dict]):
     print("[发送给AI的字符串结束]\n", flush=True)
 
 
+def _estimate_payload_chars(messages: list[dict]) -> int:
+    try:
+        return len(json.dumps(messages, ensure_ascii=False))
+    except Exception:
+        return sum(len(str(m.get("content", ""))) for m in messages)
+
+
+def _enforce_payload_limit(messages: list[dict]) -> list[dict]:
+    if not messages:
+        return messages
+
+    protected = []
+    start_index = 0
+    if messages[0].get("role") == "system":
+        protected.append(messages[0])
+        start_index = 1
+
+    tail = messages[start_index:]
+    while tail and _estimate_payload_chars(protected + tail) > MAX_REQUEST_JSON_CHARS:
+        tail.pop(0)
+
+    return protected + tail
+
+
 def _text_similarity(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return SequenceMatcher(None, a, b).ratio()
+
+
+def _normalize_for_echo(text: str) -> str:
+    t = (text or "").strip().lower()
+    t = "".join(t.split())
+    for ch in "，。！？、,.!?;；:：\"'“”‘’（）()[]【】{}<>《》-—_":
+        t = t.replace(ch, "")
+    return t
+
+
+def _is_echo_input(candidate: str, last_reply: str) -> tuple[bool, float]:
+    if not candidate or not last_reply:
+        return False, 0.0
+
+    c = _normalize_for_echo(candidate)
+    r = _normalize_for_echo(last_reply)
+    if not c or not r:
+        return False, 0.0
+
+    sim = _text_similarity(c, r)
+    if sim >= SIMILARITY_BLOCK_THRESHOLD:
+        return True, sim
+
+    if len(c) <= 18 and c in r:
+        return True, sim
+
+    if len(c) >= 6 and len(r) >= 6:
+        overlap = len(set(c) & set(r)) / max(1, len(set(c)))
+        if overlap >= 0.85:
+            return True, sim
+
+    return False, sim
 
 
 def _prune_request_times(request_times: deque, now_ts: float):
@@ -1152,10 +1246,31 @@ def _can_send_request(request_times: deque) -> tuple[bool, int]:
     return remaining > 0, max(0, remaining)
 
 
+def _can_send_by_interval(last_request_ts: float, now_ts: float) -> tuple[bool, float]:
+    if last_request_ts <= 0:
+        return True, 0.0
+    wait = MIN_REQUEST_INTERVAL_SECONDS - (now_ts - last_request_ts)
+    return wait <= 0, max(0.0, wait)
+
+
+def _is_duplicate_input(candidate: str, last_input: str, last_ts: float, now_ts: float) -> bool:
+    if not candidate or not last_input:
+        return False
+    if (now_ts - last_ts) > DUPLICATE_INPUT_WINDOW_SECONDS:
+        return False
+    return _normalize_for_echo(candidate) == _normalize_for_echo(last_input)
+
+
 def chat(conversation_history, user_input):
     """发送消息并流式获取 DeepSeek 回复"""
+    if "pro" in (DEEPSEEK_MODEL or "").lower():
+        raise RuntimeError(f"禁止使用高成本模型: {DEEPSEEK_MODEL}，请改为 deepseek-v4-flash")
+
     conversation_history.append({"role": "user", "content": user_input})
     messages_for_request = _build_messages_for_request(conversation_history)
+    messages_for_request = _enforce_payload_limit(messages_for_request)
+    payload_chars = _estimate_payload_chars(messages_for_request)
+    print(f"[请求体大小] messages_json_chars={payload_chars}", flush=True)
     _print_request_messages(messages_for_request)
     _log_step("AI请求开始")
 
@@ -1168,11 +1283,17 @@ def chat(conversation_history, user_input):
         "messages": messages_for_request,
         "stream": True,
         "max_tokens": MAX_RESPONSE_TOKENS,
+        "temperature": 0.2,
         "thinking": {"type": "disabled"},
     }
 
-    response = requests.post(DEEPSEEK_API_URL, headers=headers,
-                             data=json.dumps(payload), stream=True)
+    response = requests.post(
+        DEEPSEEK_API_URL,
+        headers=headers,
+        data=json.dumps(payload),
+        stream=True,
+        timeout=(5, 60),
+    )
     _log_step("AI请求完成")
     if response.status_code != 200:
         raise Exception(f"HTTP {response.status_code}: {response.text}")
@@ -1269,9 +1390,10 @@ def main():
     if mode == "full" and VOICE_OUTPUT_AVAILABLE:
         speak("我们开始聊天吧")
 
-    now = datetime.datetime.now().strftime("%Y年%m月%d日 %H:%M:%S")
-    system_prompt = (f"你是一个智能助手，当前时间是 {now}，"
-                     "请用用户相同的语言回答问题。回答要简短精炼，不超过3句话。")
+    system_prompt = (
+        "你是一个智能助手，请用用户相同的语言回答问题。"
+        "回答要简短精炼，不超过3句话。"
+    )
     conversation_history = [{"role": "system", "content": system_prompt}]
 
     use_voice_input  = mode in ("full", "voice+text")
@@ -1280,11 +1402,28 @@ def main():
     last_ai_reply_for_echo_filter: str = ""
     tts_cooldown_until = 0.0
     request_times = deque()
+    last_request_ts = 0.0
+    request_count_in_session = 0
+    last_sent_input = ""
+    last_sent_input_ts = 0.0
 
     while True:
         if interrupted_input:
-            user_input = interrupted_input
+            now_ts = time.time()
+            if now_ts < tts_cooldown_until:
+                wait_sec = max(0.0, tts_cooldown_until - now_ts)
+                print(f"[防自激] 打断输入冷却中，{wait_sec:.1f}s 后处理", flush=True)
+                time.sleep(min(0.5, wait_sec))
+                continue
+
+            candidate_input = interrupted_input
             interrupted_input = ""
+            if candidate_input and last_ai_reply_for_echo_filter:
+                is_echo, similarity = _is_echo_input(candidate_input, last_ai_reply_for_echo_filter)
+                if is_echo:
+                    print(f"[防自激] 忽略疑似回声打断输入（相似度 {similarity:.2f}）", flush=True)
+                    continue
+            user_input = candidate_input
         elif use_voice_input:
             user_input = ""
             consecutive_fails = 0
@@ -1300,8 +1439,8 @@ def main():
 
                     user_input = listen_from_microphone()
                     if user_input and last_ai_reply_for_echo_filter:
-                        similarity = _text_similarity(user_input, last_ai_reply_for_echo_filter)
-                        if similarity >= SIMILARITY_BLOCK_THRESHOLD:
+                        is_echo, similarity = _is_echo_input(user_input, last_ai_reply_for_echo_filter)
+                        if is_echo:
                             print(f"[防自激] 忽略疑似回声输入（相似度 {similarity:.2f}）", flush=True)
                             user_input = ""
 
@@ -1396,20 +1535,39 @@ def main():
             _announce_tts_status(mode)
             continue
 
+        if request_count_in_session >= MAX_REQUESTS_PER_SESSION:
+            print(f"[限流] 本次会话请求已达上限({MAX_REQUESTS_PER_SESSION})，请重启程序继续。", flush=True)
+            continue
+
+        now_ts = time.time()
         can_send, remaining = _can_send_request(request_times)
         if not can_send:
             print("[限流] 60秒内请求次数已达上限，请稍后再试。", flush=True)
             continue
 
+        interval_ok, wait_sec = _can_send_by_interval(last_request_ts, now_ts)
+        if not interval_ok:
+            print(f"[限流] 请求间隔过短，请 {wait_sec:.1f}s 后再试。", flush=True)
+            continue
+
+        if _is_duplicate_input(user_input, last_sent_input, last_sent_input_ts, now_ts):
+            print("[防抖] 忽略短时间内重复输入。", flush=True)
+            continue
+
+        request_times.append(now_ts)
+        last_request_ts = now_ts
+        request_count_in_session += 1
+        last_sent_input = user_input
+        last_sent_input_ts = now_ts
+
         try:
             _log_step("AI回复开始")
             conversation_history, reply = chat(conversation_history, user_input)
-            request_times.append(time.time())
             last_ai_reply_for_echo_filter = reply or ""
             if use_voice_output and reply:
                 if use_voice_input:
                     interrupted_input = speak_interruptible(reply)
-                    tts_cooldown_until = time.time() + TTS_INPUT_COOLDOWN_SECONDS
+                    tts_cooldown_until = time.time() + max(TTS_INPUT_COOLDOWN_SECONDS, INTERRUPTED_INPUT_COOLDOWN_SECONDS)
                 else:
                     speak(reply)
         except Exception as e:
