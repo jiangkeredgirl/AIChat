@@ -24,10 +24,22 @@ from difflib import SequenceMatcher
 import requests
 
 
-# ── DeepSeek 配置 ────────────────────────────────────────────────────
-DEEPSEEK_API_KEY = "sk-892f8f3341d34354b8d245ade13d9269"
-DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
-DEEPSEEK_MODEL   = "deepseek-v4-flash"
+# ── 聊天模型配置（DeepSeek / 豆包）─────────────────────────────────────
+CHAT_PROVIDER = os.getenv("CHAT_PROVIDER", "deepseek").strip().lower()
+
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-892f8f3341d34354b8d245ade13d9269")
+DEEPSEEK_API_URL = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/chat/completions")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+
+DOUBAO_API_KEY = os.getenv("DOUBAO_API_KEY", "ark-ce45b71c-48f6-4b17-bf2d-95b41405ffff-7b27f")
+DOUBAO_API_URL = os.getenv("DOUBAO_API_URL", "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
+DOUBAO_MODEL = os.getenv("DOUBAO_MODEL", "doubao-seed-2-0-pro-260215")
+
+
+def _current_chat_config() -> tuple[str, str, str, str]:
+    if CHAT_PROVIDER == "doubao":
+        return "doubao", DOUBAO_API_KEY, DOUBAO_API_URL, DOUBAO_MODEL
+    return "deepseek", DEEPSEEK_API_KEY, DEEPSEEK_API_URL, DEEPSEEK_MODEL
 
 # ── 豆包 TTS（参考 doubao_tts_py-master HTTP）────────────────────────
 DOUBAO_TTS_ENABLED = os.getenv("DOUBAO_TTS_ENABLED", "1") == "1"
@@ -1262,33 +1274,37 @@ def _is_duplicate_input(candidate: str, last_input: str, last_ts: float, now_ts:
 
 
 def chat(conversation_history, user_input):
-    """发送消息并流式获取 DeepSeek 回复"""
-    if "pro" in (DEEPSEEK_MODEL or "").lower():
-        raise RuntimeError(f"禁止使用高成本模型: {DEEPSEEK_MODEL}，请改为 deepseek-v4-flash")
+    """发送消息并流式获取模型回复"""
+    provider, api_key, api_url, model = _current_chat_config()
+
+    if provider == "deepseek" and "pro" in (model or "").lower():
+        raise RuntimeError(f"禁止使用高成本模型: {model}，请改为 deepseek-v4-flash")
 
     conversation_history.append({"role": "user", "content": user_input})
     messages_for_request = _build_messages_for_request(conversation_history)
     messages_for_request = _enforce_payload_limit(messages_for_request)
     payload_chars = _estimate_payload_chars(messages_for_request)
     print(f"[请求体大小] messages_json_chars={payload_chars}", flush=True)
+    print(f"[聊天模型] provider={provider} model={model}", flush=True)
     _print_request_messages(messages_for_request)
     _log_step("AI请求开始")
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
     }
     payload = {
-        "model": DEEPSEEK_MODEL,
+        "model": model,
         "messages": messages_for_request,
         "stream": True,
         "max_tokens": MAX_RESPONSE_TOKENS,
         "temperature": 0.2,
-        "thinking": {"type": "disabled"},
     }
+    if provider == "deepseek":
+        payload["thinking"] = {"type": "disabled"}
 
     response = requests.post(
-        DEEPSEEK_API_URL,
+        api_url,
         headers=headers,
         data=json.dumps(payload),
         stream=True,
@@ -1370,12 +1386,13 @@ def choose_mode() -> str:
 # ── 主函数 ────────────────────────────────────────────────────────────
 def main():
     print("=" * 50)
-    print("        欢迎使用 DeepSeek 聊天助手")
+    print("      欢迎使用 AI 聊天助手（DeepSeek/豆包）")
     print("=" * 50)
     print("输入 'quit' 或 'exit' 退出程序")
     print("输入 'clear' 清除对话历史")
     print("输入 'history' 查看历史记录")
     print("输入 'mode' 切换聊天模式")
+    print("环境变量 CHAT_PROVIDER 可切换聊天模型：deepseek / doubao")
     print("=" * 50)
 
     mode = choose_mode()
