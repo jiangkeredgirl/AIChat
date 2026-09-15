@@ -1,4 +1,5 @@
 import logging
+import struct
 import threading
 from typing import Callable, Optional
 
@@ -9,14 +10,26 @@ from config import INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE, CHANNELS, CHUNK_SIZE
 logger = logging.getLogger(__name__)
 
 
+def _compute_rms(data: bytes) -> float:
+    """Compute RMS energy of 16-bit PCM audio data."""
+    n_samples = len(data) // 2
+    if n_samples == 0:
+        return 0.0
+    samples = struct.unpack(f"<{n_samples}h", data)
+    sum_sq = sum(s * s for s in samples)
+    return (sum_sq / n_samples) ** 0.5
+
+
 class AudioHandler:
     """Handles microphone capture and speaker playback via PyAudio."""
 
     def __init__(
         self,
         on_audio_chunk: Optional[Callable[[bytes], None]] = None,
+        on_voice_detected: Optional[Callable[[float], None]] = None,
     ):
         self.on_audio_chunk = on_audio_chunk
+        self.on_voice_detected = on_voice_detected
         self._pa = pyaudio.PyAudio()
         self._mic_stream = None
         self._spk_stream = None
@@ -70,11 +83,23 @@ class AudioHandler:
                     logger.error(f"播放音频错误: {e}")
 
     def _mic_callback(self, in_data, frame_count, time_info, status):
+        if self.on_voice_detected:
+            rms = _compute_rms(in_data)
+            self.on_voice_detected(rms)
         if self.on_audio_chunk:
             self.on_audio_chunk(in_data)
         return (None, pyaudio.paContinue)
 
     def shutdown(self):
-        self.stop_microphone()
-        self.stop_speaker()
-        self._pa.terminate()
+        try:
+            self.stop_microphone()
+        except Exception:
+            pass
+        try:
+            self.stop_speaker()
+        except Exception:
+            pass
+        try:
+            self._pa.terminate()
+        except Exception:
+            pass

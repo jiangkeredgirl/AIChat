@@ -6,7 +6,7 @@ from typing import Callable, Optional
 
 import websockets
 
-from config import WS_URL_TEMPLATE
+from config import WS_URL_TEMPLATE, SYSTEM_INSTRUCTIONS
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,8 @@ class QwenRealtimeClient:
         on_ai_text: Optional[Callable[[str], None]] = None,
         on_status: Optional[Callable[[str], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
+        on_speech_start: Optional[Callable[[], None]] = None,
+        on_speech_end: Optional[Callable[[], None]] = None,
     ):
         self.api_key = api_key
         self.workspace_id = workspace_id
@@ -35,6 +37,8 @@ class QwenRealtimeClient:
         self.on_ai_text = on_ai_text
         self.on_status = on_status
         self.on_error = on_error
+        self.on_speech_start = on_speech_start
+        self.on_speech_end = on_speech_end
 
         self._ws = None
         self._running = False
@@ -65,6 +69,7 @@ class QwenRealtimeClient:
             "session": {
                 "modalities": ["text", "audio"],
                 "voice": self.voice,
+                "instructions": SYSTEM_INSTRUCTIONS,
                 "turn_detection": {
                     "type": "server_vad",
                     "threshold": 0.5,
@@ -83,10 +88,15 @@ class QwenRealtimeClient:
         self._running = False
         if self._send_task:
             self._send_task.cancel()
+            self._send_task = None
         if self._recv_task:
             self._recv_task.cancel()
+            self._recv_task = None
         if self._ws:
-            await self._ws.close()
+            try:
+                await asyncio.wait_for(self._ws.close(), timeout=2)
+            except Exception:
+                pass
             self._ws = None
         self._status("已断开连接")
 
@@ -130,6 +140,14 @@ class QwenRealtimeClient:
             text = event.get("transcript", "")
             if text and self.on_ai_text:
                 self.on_ai_text(text)
+
+        elif t == "input_audio_buffer.speech_started":
+            if self.on_speech_start:
+                self.on_speech_start()
+
+        elif t == "input_audio_buffer.speech_stopped":
+            if self.on_speech_end:
+                self.on_speech_end()
 
         elif t == "response.done":
             pass

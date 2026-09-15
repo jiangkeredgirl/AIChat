@@ -36,3 +36,14 @@ CHUNK_SIZE = 3200  # 100ms at 16kHz
 # VAD settings
 VAD_THRESHOLD = 0.5
 SILENCE_DURATION_MS = 800
+
+# System instructions - keep AI responses short
+SYSTEM_INSTRUCTIONS = (
+    "你是一个语音助手。请用简短的口语回答问题，每次回答只说1到3句话，"
+    "不要长篇大论。避免使用列表、编号、markdown格式。"
+    "回答要自然、简洁，像朋友聊天一样。"
+)
+
+# Auto mode settings
+AUTO_DISCONNECT_TIMEOUT = 60  # seconds of no voice before auto-disconnect
+VOICE_ENERGY_THRESHOLD = 500  # RMS threshold for voice detection (16-bit PCM)
