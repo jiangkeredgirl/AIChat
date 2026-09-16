@@ -332,7 +332,9 @@ class QwenRealtimeClient:
             msg = event.get("error", {}).get("message", "未知错误")
             lower_msg = msg.lower()
             # Ignore harmless race condition errors
-            if "no active response" in lower_msg or "response is in progress" in lower_msg:
+            if ("no active response" in lower_msg
+                    or "response is in progress" in lower_msg
+                    or "while user is speaking" in lower_msg):
                 logger.debug(f"忽略: {msg}")
             else:
                 self._error(f"服务端错误: {msg}")
