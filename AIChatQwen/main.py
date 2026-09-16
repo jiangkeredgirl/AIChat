@@ -2,21 +2,23 @@ import asyncio
 import json
 import logging
 import os
+import struct
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, filedialog
 
 from config import API_KEY, WORKSPACE_ID, MODELS, VOICES, AUTO_DISCONNECT_TIMEOUT, VOICE_ENERGY_THRESHOLD
 from qwen_realtime import QwenRealtimeClient
 from audio_handler import AudioHandler
 
+logger = logging.getLogger(__name__)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger(__name__)
 
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
@@ -41,7 +43,7 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Qwen-Audio 实时语音聊天")
-        self.root.geometry("640x760")
+        self.root.geometry("700x850")
         self.root.resizable(True, True)
 
         self.loop = None
@@ -59,6 +61,11 @@ class App:
         self._reconnect_pending = False
         self._manual_disconnect = False
 
+        # Video state
+        self.video_capture = None
+        self._video_showing = False
+        self._video_after_id = None
+
         self._build_ui()
         self._load_ui_settings()
         self._center_window()
@@ -72,7 +79,6 @@ class App:
         self.root.geometry(f"+{x}+{y}")
 
     def _load_ui_settings(self):
-        """Load saved settings into UI fields. Priority: settings.json > env vars."""
         s = load_settings()
         api_key = s.get("api_key", "")
         ws_id = s.get("workspace_id", "")
@@ -90,7 +96,6 @@ class App:
             self.combo_voice.set(voice)
 
     def _save_ui_settings(self):
-        """Save current UI fields to settings.json."""
         save_settings({
             "api_key": self.entry_api_key.get().strip(),
             "workspace_id": self.entry_ws_id.get().strip(),
@@ -144,11 +149,23 @@ class App:
         self.btn_disconnect = ttk.Button(ctrl, text="断开", command=self._on_manual_disconnect, state=tk.DISABLED)
         self.btn_disconnect.pack(side=tk.LEFT, padx=4)
 
+        ttk.Separator(ctrl, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+
+        self.btn_video = ttk.Button(ctrl, text="📷 视频", command=self._toggle_video)
+        self.btn_video.pack(side=tk.LEFT, padx=4)
+        self.btn_send_audio = ttk.Button(ctrl, text="🎵 发送音频", command=self._on_send_audio_file)
+        self.btn_send_audio.pack(side=tk.LEFT, padx=4)
+
         self.status_var = tk.StringVar(value="未连接")
         ttk.Label(ctrl, textvariable=self.status_var, foreground="gray").pack(side=tk.LEFT, padx=16)
 
         self.energy_var = tk.StringVar(value="")
         ttk.Label(ctrl, textvariable=self.energy_var, foreground="#888888").pack(side=tk.RIGHT, padx=8)
+
+        # --- Video frame (hidden by default) ---
+        self.video_frame = ttk.LabelFrame(self.root, text="视频画面", padding=2)
+        self.video_label = tk.Label(self.video_frame, bg="black", width=320, height=240, text="摄像头未开启")
+        self.video_label.pack(fill=tk.X)
 
         # --- Conversation frame ---
         conv = ttk.LabelFrame(self.root, text="对话记录", padding=4)
@@ -162,6 +179,17 @@ class App:
         self.text_chat.tag_configure("user", foreground="#0078D4", font=("Microsoft YaHei", 10, "bold"))
         self.text_chat.tag_configure("ai", foreground="#107C10", font=("Microsoft YaHei", 10, "bold"))
         self.text_chat.tag_configure("system", foreground="#888888", font=("Microsoft YaHei", 9))
+
+        # --- Text input frame ---
+        input_frame = ttk.Frame(self.root, padding=4)
+        input_frame.pack(fill=tk.X, **pad)
+
+        self.entry_text = ttk.Entry(input_frame, font=("Microsoft YaHei", 10))
+        self.entry_text.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        self.entry_text.bind("<Return>", lambda e: self._on_send_text())
+
+        self.btn_send_text = ttk.Button(input_frame, text="发送", command=self._on_send_text)
+        self.btn_send_text.pack(side=tk.RIGHT)
 
         # --- Status bar ---
         bar = ttk.Frame(self.root)
@@ -177,9 +205,13 @@ class App:
         self.spk_label = ttk.Label(bar, textvariable=self.spk_var, foreground="gray")
         self.spk_label.pack(side=tk.RIGHT, padx=8, pady=4)
 
+    # ── Chat display ──
+
     def _append_chat(self, role: str, text: str):
         self.text_chat.configure(state=tk.NORMAL)
         if role == "user":
+            self.text_chat.insert(tk.END, "💬 你说: ", "user")
+        elif role == "user_voice":
             self.text_chat.insert(tk.END, "🎤 你说: ", "user")
         elif role == "ai":
             self.text_chat.insert(tk.END, "🤖 AI: ", "ai")
@@ -200,6 +232,110 @@ class App:
 
     def _set_spk(self, text: str, color: str = "gray"):
         self.root.after(0, lambda: (self.spk_var.set(text), self.spk_label.configure(foreground=color)))
+
+    # ── Text input ──
+
+    def _on_send_text(self):
+        text = self.entry_text.get().strip()
+        if not text:
+            return
+        self.entry_text.delete(0, tk.END)
+        self._append_chat("user", text)
+        if self.client and self.connected and self.loop:
+            asyncio.run_coroutine_threadsafe(self.client.send_text(text), self.loop)
+            self._last_speech_time = time.time()
+        else:
+            self._append_chat("system", "未连接，无法发送文字")
+
+    # ── Audio file send ──
+
+    def _on_send_audio_file(self):
+        filepath = filedialog.askopenfilename(
+            title="选择音频文件",
+            filetypes=[
+                ("WAV 文件", "*.wav"),
+                ("PCM 文件", "*.pcm"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if not filepath:
+            return
+        if not self.client or not self.connected or not self.loop:
+            self._append_chat("system", "未连接，无法发送音频")
+            return
+        self._append_chat("system", f"正在发送音频: {os.path.basename(filepath)}")
+        threading.Thread(target=self._send_audio_file_thread, args=(filepath,), daemon=True).start()
+
+    def _send_audio_file_thread(self, filepath: str):
+        try:
+            import wave
+            if filepath.lower().endswith(".wav"):
+                with wave.open(filepath, "rb") as wf:
+                    sample_rate = wf.getframerate()
+                    channels = wf.getnchannels()
+                    sampwidth = wf.getsampwidth()
+                    pcm_data = wf.readframes(wf.getnframes())
+            else:
+                with open(filepath, "rb") as f:
+                    pcm_data = f.read()
+                sample_rate = 16000
+
+            self._append_chat("system",
+                f"音频: {len(pcm_data)} 字节, {sample_rate}Hz, "
+                f"{len(pcm_data) / (sample_rate * 2):.1f}秒")
+            asyncio.run_coroutine_threadsafe(
+                self.client.send_audio_file(pcm_data), self.loop
+            )
+            self._last_speech_time = time.time()
+        except Exception as e:
+            self.root.after(0, lambda: self._append_chat("system", f"发送音频失败: {e}"))
+
+    # ── Video ──
+
+    def _toggle_video(self):
+        if self._video_showing:
+            self._stop_video()
+        else:
+            self._start_video()
+
+    def _start_video(self):
+        try:
+            from video_capture import VideoCapture
+        except ImportError:
+            self._append_chat("system", "缺少 opencv-python 或 Pillow，请运行: pip install opencv-python Pillow")
+            return
+
+        if self.video_capture is None:
+            self.video_capture = VideoCapture(self.video_frame, width=320, height=240)
+
+        if self.video_capture.start():
+            self._video_showing = True
+            self.video_frame.pack(fill=tk.X, padx=8, pady=4, before=self.root.nametowidget(self.video_frame.master).winfo_children()[3])
+            self.btn_video.configure(text="📷 关闭视频")
+            self._append_chat("system", "摄像头已开启")
+            self._update_video_frame()
+        else:
+            self._append_chat("system", "无法打开摄像头")
+
+    def _stop_video(self):
+        self._video_showing = False
+        if self._video_after_id:
+            self.root.after_cancel(self._video_after_id)
+            self._video_after_id = None
+        if self.video_capture:
+            self.video_capture.stop()
+        self.video_frame.pack_forget()
+        self.btn_video.configure(text="📷 视频")
+        self._append_chat("system", "摄像头已关闭")
+
+    def _update_video_frame(self):
+        if not self._video_showing or not self.video_capture:
+            return
+        photo = self.video_capture.get_frame_tk()
+        if photo:
+            self.video_label.configure(image=photo, text="")
+            self.video_label._image = photo
+        self._video_after_id = self.root.after(66, self._update_video_frame)  # ~15fps
 
     # ── Connection ──
 
@@ -271,7 +407,7 @@ class App:
         if self.audio:
             self.audio.start_microphone()
             self._set_mic("🎤 监听中", "green")
-        self._append_chat("system", "连接成功，开始对话吧！")
+        self._append_chat("system", "连接成功！支持语音、文字输入，可发送音频文件，可开启视频")
         self._start_auto_check()
 
     def _update_buttons_connected(self):
@@ -351,14 +487,12 @@ class App:
     def _on_voice_energy(self, rms: float):
         if not self.auto_mode.get():
             return
-        # Show energy level in status bar when not connected
         if not self.connected and self._mic_always_on:
             bar_len = 20
             filled = min(int(rms / 200 * bar_len), bar_len)
             bar = "█" * filled + "░" * (bar_len - filled)
             self.root.after(0, lambda: self.energy_var.set(f"🎧 监听中 {bar}"))
 
-        # Detect voice when disconnected → auto reconnect
         if not self.connected and self.auto_mode.get() and not self._manual_disconnect:
             if rms > VOICE_ENERGY_THRESHOLD and not self._reconnect_pending:
                 self._reconnect_pending = True
@@ -377,7 +511,6 @@ class App:
         self._do_connect(api_key, ws_id)
 
     def _start_auto_check(self):
-        """Start periodic check for auto-disconnect."""
         if not self.auto_mode.get():
             return
         self._stop_auto_check()
@@ -397,7 +530,6 @@ class App:
         if remaining <= 0:
             self._append_chat("system", f"超过 {AUTO_DISCONNECT_TIMEOUT} 秒未检测到语音，自动断开")
             self._do_disconnect(f"超时 {AUTO_DISCONNECT_TIMEOUT}s 无语音")
-            # Start mic monitoring for auto-reconnect
             self._start_mic_monitor()
             return
         if remaining <= 15:
@@ -405,7 +537,6 @@ class App:
         self._auto_check_id = self.root.after(2000, self._check_auto_disconnect)
 
     def _start_mic_monitor(self):
-        """Keep mic on for voice detection when disconnected in auto mode."""
         if not self.auto_mode.get():
             return
         self._mic_always_on = True
@@ -434,7 +565,7 @@ class App:
             self.audio.play_audio(data)
 
     def _on_user_text(self, text: str):
-        self.root.after(0, lambda: self._append_chat("user", text))
+        self.root.after(0, lambda: self._append_chat("user_voice", text))
 
     def _on_ai_text(self, text: str):
         self.root.after(0, lambda: self._append_chat("ai", text))
@@ -456,6 +587,11 @@ class App:
     def _on_close(self):
         self._manual_disconnect = True
         self._stop_auto_check()
+        try:
+            if self._video_showing:
+                self._stop_video()
+        except Exception:
+            pass
         try:
             if self.connected:
                 self._do_disconnect()

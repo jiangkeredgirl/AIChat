@@ -125,6 +125,32 @@ class QwenRealtimeClient:
                 "audio": base64.b64encode(pcm_data).decode(),
             }))
 
+    async def send_text(self, text: str):
+        """Send a text message to the AI."""
+        if self._ws and self._running and text.strip():
+            await self._ws.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            }))
+            await self._ws.send(json.dumps({"type": "response.create"}))
+
+    async def send_audio_file(self, pcm_data: bytes):
+        """Send raw PCM audio data (from a file) to the API."""
+        if self._ws and self._running:
+            chunk_size = 3200
+            for i in range(0, len(pcm_data), chunk_size):
+                chunk = pcm_data[i:i + chunk_size]
+                await self._ws.send(json.dumps({
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(chunk).decode(),
+                }))
+                await asyncio.sleep(0.05)
+            await self._ws.send(json.dumps({"type": "response.create"}))
+
     async def cancel_response(self):
         """Send response.cancel to stop the current AI response."""
         if self._ws and self._running:
