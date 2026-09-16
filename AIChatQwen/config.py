@@ -49,6 +49,8 @@ MANUAL_SILENCE_MS = 1200  # manual mode: silence duration before triggering resp
 # aggressiveness: 0=least aggressive, 3=most aggressive (filter more)
 WEBRTC_VAD_ENABLED = True
 WEBRTC_VAD_AGGRESSIVENESS = 3
+VAD_MIN_SPEECH_MS = 500     # 连续检测到人声多久才确认"说话中"
+VAD_MIN_SILENCE_MS = 400    # 连续检测到静音多久才确认"停止说话"
 
 # System instructions - keep AI responses short
 SYSTEM_INSTRUCTIONS = (

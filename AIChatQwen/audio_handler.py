@@ -8,6 +8,7 @@ import pyaudio
 from config import (
     INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE, CHANNELS, CHUNK_SIZE,
     WEBRTC_VAD_ENABLED, WEBRTC_VAD_AGGRESSIVENESS,
+    VAD_MIN_SPEECH_MS, VAD_MIN_SILENCE_MS,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,8 +48,8 @@ class AudioHandler:
         self._speech_confirmed = False
         self._silence_start_time = 0.0
         # Minimum durations to confirm speech/silence (avoid false triggers)
-        self._min_speech_ms = 500    # must detect voice for 500ms before reporting "speaking"
-        self._min_silence_ms = 400   # must detect silence for 400ms before reporting "stopped"
+        self._min_speech_ms = VAD_MIN_SPEECH_MS
+        self._min_silence_ms = VAD_MIN_SILENCE_MS
 
         # WebRTC VAD for human voice detection
         self._vad = None
