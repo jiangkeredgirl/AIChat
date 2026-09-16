@@ -68,4 +68,4 @@ VOICE_ENERGY_THRESHOLD = 500  # RMS threshold for voice detection (16-bit PCM)
 # Mode: "timeout" = cancel after N seconds, "sentences" = cancel after N sentences
 RESPONSE_INTERRUPT_MODE = "timeout"   # "timeout" or "sentences"
 RESPONSE_TIMEOUT_SECONDS = 60         # used when mode is "timeout"
-RESPONSE_MAX_SENTENCES = 5            # used when mode is "sentences"
+RESPONSE_MAX_SENTENCES = 10           # used when mode is "sentences"

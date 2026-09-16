@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import re
+import time
 from typing import Callable, Optional
 
 import websockets
@@ -61,6 +62,7 @@ class QwenRealtimeClient:
         self._cooldown_task = None
         self._sentence_count = 0
         self._transcript_buffer = ""
+        self._response_start_time = 0.0
 
     @property
     def is_responding(self) -> bool:
@@ -69,6 +71,11 @@ class QwenRealtimeClient:
     @property
     def is_manual(self) -> bool:
         return self.turn_detection == "manual"
+
+    @property
+    def in_protection_period(self) -> bool:
+        """First 2 seconds of AI response - ignore user interrupt to prevent false triggers."""
+        return self._is_responding and (time.time() - self._response_start_time) < 2.0
 
     def _get_url(self) -> str:
         return WS_URL_TEMPLATE.format(
@@ -146,6 +153,7 @@ class QwenRealtimeClient:
             self.reset_interrupt_counters()
             if self._is_responding:
                 await self.cancel_response()
+                await asyncio.sleep(0.3)
             await self._ws.send(json.dumps({
                 "type": "conversation.item.create",
                 "item": {
@@ -161,6 +169,7 @@ class QwenRealtimeClient:
             self.reset_interrupt_counters()
             if self._is_responding:
                 await self.cancel_response()
+                await asyncio.sleep(0.3)
             chunk_size = 3200
             for i in range(0, len(pcm_data), chunk_size):
                 chunk = pcm_data[i:i + chunk_size]
@@ -175,6 +184,9 @@ class QwenRealtimeClient:
         """Manual mode: commit audio buffer and trigger response."""
         if self._ws and self._running:
             self.reset_interrupt_counters()
+            if self._is_responding:
+                await self.cancel_response()
+                await asyncio.sleep(0.3)
             await self._ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
             await self._ws.send(json.dumps({"type": "response.create"}))
             logger.info("Manual: 已提交音频并请求回复")
@@ -268,6 +280,7 @@ class QwenRealtimeClient:
             self._stop_cooldown()
             self._sentence_count = 0
             self._transcript_buffer = ""
+            self._response_start_time = time.time()
             self._start_cancel_timer()
             if self.on_response_start:
                 self.on_response_start()
@@ -317,7 +330,12 @@ class QwenRealtimeClient:
         elif t == "error":
             self._cancel_timer()
             msg = event.get("error", {}).get("message", "未知错误")
-            self._error(f"服务端错误: {msg}")
+            lower_msg = msg.lower()
+            # Ignore harmless race condition errors
+            if "no active response" in lower_msg or "response is in progress" in lower_msg:
+                logger.debug(f"忽略: {msg}")
+            else:
+                self._error(f"服务端错误: {msg}")
 
     def _status(self, msg: str):
         logger.info(msg)

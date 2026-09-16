@@ -492,19 +492,19 @@ class App:
             if self._silence_check_id:
                 self.root.after_cancel(self._silence_check_id)
                 self._silence_check_id = None
-            self._set_mic("🎤 说话中...", "#0078D4")
-            self.root.after(0, lambda: self.energy_var.set("🎤 说话中..."))
-            # User interrupt: cancel AI if responding
-            if self.client and self.client.is_responding and self.loop:
-                asyncio.run_coroutine_threadsafe(
-                    self.client.cancel_response(), self.loop
-                )
+            # Only show "speaking" and allow interrupt if AI is NOT responding
+            if not self.client or not self.client.is_responding:
+                self._set_mic("🎤 说话中...", "#0078D4")
+                self.root.after(0, lambda: self.energy_var.set("🎤 说话中..."))
+            # Do NOT interrupt AI by voice - only text input can interrupt
         else:
             self._user_speaking = False
-            self._set_mic("🎤 监听中", "green")
-            self.root.after(0, lambda: self.energy_var.set(""))
-            # Manual mode: start silence timer to trigger response
-            if self.client and self.client.is_manual and self.connected:
+            if not self.client or not self.client.is_responding:
+                self._set_mic("🎤 监听中", "green")
+                self.root.after(0, lambda: self.energy_var.set(""))
+            # Manual mode: start silence timer only if not in cooldown
+            if (self.client and self.client.is_manual
+                    and self.connected and not self.client._cooldown):
                 if self._silence_check_id:
                     self.root.after_cancel(self._silence_check_id)
                 self._silence_check_id = self.root.after(
@@ -515,6 +515,8 @@ class App:
         """Manual mode: silence duration passed, commit and respond."""
         self._silence_check_id = None
         if self._user_speaking or not self.connected or not self.client:
+            return
+        if self.client._cooldown or self.client.is_responding:
             return
         if self.loop:
             asyncio.run_coroutine_threadsafe(

@@ -3,5 +3,5 @@
   "workspace_id": "ws-i437mewzddgz4csv",
   "model": "Flash (低延迟)",
   "voice": "longanqian",
-  "turn_detection": "Server VAD (自动)"
+  "turn_detection": "Smart Turn (智能判停)"
 }
