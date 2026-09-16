@@ -63,11 +63,6 @@ class App:
 
         # Manual turn control
         self._user_speaking = False
-        self._silence_start = 0.0
-        self._silence_check_id = None
-        self._post_response_cooldown = False
-        self._cooldown_after_response_id = None
-        self._silence_duration_ms = 1200  # wait 1.2s silence before triggering response
 
         # Video state
         self.video_capture = None
@@ -388,6 +383,8 @@ class App:
             on_ai_text=self._on_ai_text,
             on_status=self._on_status,
             on_error=self._on_error,
+            on_speech_start=self._on_speech_start,
+            on_speech_end=self._on_speech_end,
             on_response_start=self._on_response_start,
             on_response_end=self._on_response_end,
         )
@@ -469,68 +466,38 @@ class App:
     # ── Auto mode ──
 
     def _on_speech_state(self, is_speech: bool):
-        """Called by AudioHandler when voice activity state changes."""
+        """Called by AudioHandler when voice activity state changes.
+        Used for user interrupt: cancel AI when user starts speaking."""
         if is_speech:
-            # User started speaking
-            self._user_speaking = True
             self._last_speech_time = time.time()
             self._reconnect_pending = False
-            self._post_response_cooldown = False
-            if self._silence_check_id:
-                self.root.after_cancel(self._silence_check_id)
-                self._silence_check_id = None
             self._set_mic("🎤 说话中...", "#0078D4")
             self.root.after(0, lambda: self.energy_var.set("🎤 说话中..."))
-            # If AI is responding, cancel it (user interrupt)
+            # User interrupt: cancel AI if responding
             if self.client and self.client.is_responding and self.loop:
                 asyncio.run_coroutine_threadsafe(
                     self.client.cancel_response(), self.loop
                 )
         else:
-            # User stopped speaking - start silence timer
-            self._user_speaking = False
             self._set_mic("🎤 监听中", "green")
             self.root.after(0, lambda: self.energy_var.set(""))
-            if self._silence_check_id:
-                self.root.after_cancel(self._silence_check_id)
-            self._silence_start = time.time()
-            self._silence_check_id = self.root.after(
-                self._silence_duration_ms, self._on_silence_timeout
-            )
 
-    def _on_silence_timeout(self):
-        """Called after user stops speaking and silence duration passes."""
-        self._silence_check_id = None
-        if self._user_speaking or self._post_response_cooldown:
-            return
-        if not self.client or not self.connected or not self.loop:
-            return
-        # Commit audio buffer and trigger AI response
-        asyncio.run_coroutine_threadsafe(
-            self.client.commit_and_respond(), self.loop
-        )
+    def _on_speech_start(self):
+        """Called by client on server_vad speech_started event."""
+        self._last_speech_time = time.time()
+        self._voice_active = True
+        self._reconnect_pending = False
+
+    def _on_speech_end(self):
+        """Called by client on server_vad speech_stopped event."""
+        self._last_speech_time = time.time()
+        self._voice_active = False
 
     def _on_response_start(self):
         self._set_spk("🔊 播放中", "#0078D4")
 
     def _on_response_end(self):
         self._set_spk("🔊 已启动", "green")
-        # Start post-response cooldown (5s) to prevent auto-re-triggering
-        self._post_response_cooldown = True
-        if self._cooldown_after_response_id:
-            self.root.after_cancel(self._cooldown_after_response_id)
-        self._cooldown_after_response_id = self.root.after(
-            5000, self._end_cooldown
-        )
-        # Clear audio buffer to prevent stale audio
-        if self.client and self.loop:
-            asyncio.run_coroutine_threadsafe(
-                self.client.clear_audio_buffer(), self.loop
-            )
-
-    def _end_cooldown(self):
-        self._cooldown_after_response_id = None
-        self._post_response_cooldown = False
 
     def _on_voice_energy(self, rms: float):
         if not self.auto_mode.get():
