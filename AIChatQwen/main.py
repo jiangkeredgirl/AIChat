@@ -230,6 +230,7 @@ class App:
             on_error=self._on_error,
             on_speech_start=self._on_speech_start,
             on_speech_end=self._on_speech_end,
+            on_response_cancelled=self._on_response_cancelled,
         )
 
         if self.loop is None:
@@ -310,6 +311,9 @@ class App:
         self._last_speech_time = time.time()
         self._voice_active = False
         self.root.after(0, lambda: self.energy_var.set(""))
+
+    def _on_response_cancelled(self, reason: str):
+        self._append_chat("system", f"（AI 回复已自动截断: {reason}）")
 
     def _on_voice_energy(self, rms: float):
         if not self.auto_mode.get():
