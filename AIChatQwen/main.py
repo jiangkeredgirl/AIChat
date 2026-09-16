@@ -252,7 +252,10 @@ class App:
     # ── Chat display ──
 
     def _append_chat(self, role: str, text: str):
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%H:%M:%S")
         self.text_chat.configure(state=tk.NORMAL)
+        self.text_chat.insert(tk.END, f"[{timestamp}] ", "system")
         if role == "user":
             self.text_chat.insert(tk.END, "💬 你说: ", "user")
         elif role == "user_voice":
