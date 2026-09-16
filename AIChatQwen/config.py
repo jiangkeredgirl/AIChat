@@ -41,7 +41,7 @@ CHUNK_SIZE = 3200  # 100ms at 16kHz
 
 # VAD settings
 VAD_THRESHOLD = 0.5
-SILENCE_DURATION_MS = 800
+SILENCE_DURATION_MS = 400  # 服务器检测到多久静音后触发回复（越小越快）
 
 # Turn detection modes
 TURN_DETECTION_MODES = {
@@ -49,14 +49,15 @@ TURN_DETECTION_MODES = {
     "Smart Turn (智能判停)": "smart_turn",
     "Manual (手动)": "manual",
 }
-MANUAL_SILENCE_MS = 1200  # manual mode: silence duration before triggering response
+MANUAL_SILENCE_MS = 800  # manual mode: silence duration before triggering response
 
 # WebRTC VAD - filters non-human audio (noise, music, etc.)
 # aggressiveness: 0=least aggressive, 3=most aggressive (filter more)
 WEBRTC_VAD_ENABLED = True
 WEBRTC_VAD_AGGRESSIVENESS = 3
-VAD_MIN_SPEECH_MS = 500     # 连续检测到人声多久才确认"说话中"
-VAD_MIN_SILENCE_MS = 400    # 连续检测到静音多久才确认"停止说话"
+VAD_ENERGY_THRESHOLD = 300   # RMS 能量阈值，低于此值直接跳过 VAD（过滤低能量噪声）
+VAD_MIN_SPEECH_MS = 300     # 连续检测到人声多久才确认"说话中"（越小越快）
+VAD_MIN_SILENCE_MS = 300    # 连续检测到静音多久才确认"停止说话"（越小越快）
 
 # System instructions - keep AI responses short
 SYSTEM_INSTRUCTIONS = (
@@ -71,6 +72,8 @@ SYSTEM_INSTRUCTIONS = (
 # Auto mode settings
 AUTO_DISCONNECT_TIMEOUT = 180  # seconds of no voice before auto-disconnect
 VOICE_ENERGY_THRESHOLD = 500  # RMS threshold for voice detection (16-bit PCM)
+
+RESPONSE_COOLDOWN_SECONDS = 0.5  # AI回复结束后冷却期（阻止音频发送，防回声触发假回复）
 
 # AI response auto-interrupt settings
 # Mode: "timeout" = cancel after N seconds, "sentences" = cancel after N sentences

@@ -675,6 +675,9 @@ class App:
 
     def _on_mic_chunk(self, data: bytes):
         if self.client and self.connected and self.loop:
+            # Block audio during cooldown to prevent server from detecting echo as user speech
+            if self.client._cooldown:
+                return
             asyncio.run_coroutine_threadsafe(self.client.send_audio(data), self.loop)
 
     def _on_ai_audio(self, data: bytes):

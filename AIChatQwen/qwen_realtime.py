@@ -11,7 +11,7 @@ import websockets
 from config import (
     WS_URL_TEMPLATE, SYSTEM_INSTRUCTIONS,
     RESPONSE_TIMEOUT_SECONDS, MANUAL_SILENCE_MS,
-    OMNI_MODELS,
+    OMNI_MODELS, RESPONSE_COOLDOWN_SECONDS,
 )
 
 logger = logging.getLogger(__name__)
@@ -159,9 +159,6 @@ class QwenRealtimeClient:
             if self._is_responding:
                 await self.cancel_response()
                 await asyncio.sleep(0.3)
-            # Clear audio buffer first so server doesn't think user is still speaking
-            await self.clear_audio_buffer()
-            await asyncio.sleep(0.2)
             await self._ws.send(json.dumps({
                 "type": "conversation.item.create",
                 "item": {
@@ -170,7 +167,10 @@ class QwenRealtimeClient:
                     "content": [{"type": "input_text", "text": text}],
                 },
             }))
-            await self._ws.send(json.dumps({"type": "response.create"}))
+            # Only manually trigger response in manual mode
+            # In server_vad/smart_turn, server auto-creates responses
+            if self.turn_detection == "manual":
+                await self._ws.send(json.dumps({"type": "response.create"}))
 
     async def send_image(self, image_path: str):
         """Send image. Omni models: input_image_buffer.append. Audio models: text description."""
@@ -391,7 +391,6 @@ class QwenRealtimeClient:
         self._cooldown = True
         self._stop_cooldown()
         self._cooldown_task = asyncio.create_task(self._cooldown_timer())
-        asyncio.create_task(self.clear_audio_buffer())
 
     def _stop_cooldown(self):
         if self._cooldown_task:
@@ -400,7 +399,7 @@ class QwenRealtimeClient:
 
     async def _cooldown_timer(self):
         try:
-            await asyncio.sleep(3)
+            await asyncio.sleep(RESPONSE_COOLDOWN_SECONDS)
             self._cooldown = False
             logger.info("冷却期结束")
         except asyncio.CancelledError:

@@ -8,7 +8,7 @@ import pyaudio
 from config import (
     INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE, CHANNELS, CHUNK_SIZE,
     WEBRTC_VAD_ENABLED, WEBRTC_VAD_AGGRESSIVENESS,
-    VAD_MIN_SPEECH_MS, VAD_MIN_SILENCE_MS,
+    VAD_MIN_SPEECH_MS, VAD_MIN_SILENCE_MS, VAD_ENERGY_THRESHOLD,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ class AudioHandler:
         self._min_silence_ms = VAD_MIN_SILENCE_MS
         # Echo cancellation: track speaker playback to filter out AI audio
         self._last_speaker_write_time = 0.0
-        self._echo_tail_ms = 1500  # ignore VAD for this long after speaker stops
+        self._echo_tail_ms = 800  # ignore VAD for this long after speaker stops
 
         # WebRTC VAD for human voice detection
         self._vad = None
@@ -145,15 +145,18 @@ class AudioHandler:
         now = time.time()
 
         # Always report energy for monitoring
+        rms = _compute_rms(in_data)
         if self.on_voice_detected:
-            rms = _compute_rms(in_data)
             self.on_voice_detected(rms)
 
-        # Check human voice via WebRTC VAD
-        is_speech = self._has_human_voice(in_data)
+        # Energy pre-filter: skip VAD for low-energy audio (background noise)
+        if rms < VAD_ENERGY_THRESHOLD:
+            is_speech = False
+        else:
+            # Check human voice via WebRTC VAD
+            is_speech = self._has_human_voice(in_data)
 
         # Echo cancellation: if speaker recently played audio, ignore VAD
-        # (detected "voice" is likely echo from speaker, not real user voice)
         if is_speech and self._is_echo():
             is_speech = False
 
