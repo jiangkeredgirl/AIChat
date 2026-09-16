@@ -118,7 +118,7 @@ class QwenRealtimeClient:
             "instructions": SYSTEM_INSTRUCTIONS,
             "max_history_turns": 5,
             "turn_detection": self._build_turn_detection_config(),
-            "input_audio_transcription": {"model": ""},
+            "input_audio_transcription": {"model": "qwen3-asr-flash-realtime"},
         }
 
         await self._ws.send(json.dumps({
@@ -167,10 +167,7 @@ class QwenRealtimeClient:
                     "content": [{"type": "input_text", "text": text}],
                 },
             }))
-            # Only manually trigger response in manual mode
-            # In server_vad/smart_turn, server auto-creates responses
-            if self.turn_detection == "manual":
-                await self._ws.send(json.dumps({"type": "response.create"}))
+            await self._ws.send(json.dumps({"type": "response.create"}))
 
     async def send_image(self, image_path: str):
         """Send image. Omni models: input_image_buffer.append. Audio models: text description."""

@@ -55,7 +55,7 @@ MANUAL_SILENCE_MS = 800  # manual mode: silence duration before triggering respo
 # aggressiveness: 0=least aggressive, 3=most aggressive (filter more)
 WEBRTC_VAD_ENABLED = True
 WEBRTC_VAD_AGGRESSIVENESS = 3
-VAD_ENERGY_THRESHOLD = 300   # RMS 能量阈值，低于此值直接跳过 VAD（过滤低能量噪声）
+VAD_ENERGY_THRESHOLD = 200   # RMS 能量阈值，低于此值直接跳过 VAD（过滤低能量噪声）
 VAD_MIN_SPEECH_MS = 300     # 连续检测到人声多久才确认"说话中"（越小越快）
 VAD_MIN_SILENCE_MS = 300    # 连续检测到静音多久才确认"停止说话"（越小越快）
 
