@@ -172,6 +172,8 @@ class App:
         self.btn_video.pack(side=tk.LEFT, padx=4)
         self.btn_send_audio = ttk.Button(ctrl, text="🎵 发送音频", command=self._on_send_audio_file)
         self.btn_send_audio.pack(side=tk.LEFT, padx=4)
+        self.btn_send_image = ttk.Button(ctrl, text="🖼️ 图片", command=self._on_send_image)
+        self.btn_send_image.pack(side=tk.LEFT, padx=4)
 
         self.status_var = tk.StringVar(value="未连接")
         ttk.Label(ctrl, textvariable=self.status_var, foreground="gray").pack(side=tk.LEFT, padx=16)
@@ -306,6 +308,22 @@ class App:
             self._last_speech_time = time.time()
         except Exception as e:
             self.root.after(0, lambda: self._append_chat("system", f"发送音频失败: {e}"))
+
+    # ── Image input ──
+
+    def _on_send_image(self):
+        filepath = filedialog.askopenfilename(
+            title="选择图片",
+            filetypes=[("图片", "*.jpg *.jpeg *.png *.gif *.bmp *.webp"), ("所有", "*.*")],
+        )
+        if not filepath:
+            return
+        if not self.client or not self.connected or not self.loop:
+            self._append_chat("system", "未连接，无法发送图片")
+            return
+        self._append_chat("user", f"[图片: {os.path.basename(filepath)}]")
+        asyncio.run_coroutine_threadsafe(self.client.send_image(filepath), self.loop)
+        self._last_speech_time = time.time()
 
     # ── Video ──
 

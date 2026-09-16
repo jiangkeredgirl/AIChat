@@ -167,6 +167,31 @@ class QwenRealtimeClient:
             }))
             await self._ws.send(json.dumps({"type": "response.create"}))
 
+    async def send_image(self, image_path: str):
+        """Send image info as text (audio model doesn't support image input)."""
+        if not self._ws or not self._running:
+            return
+        try:
+            import os
+            filename = os.path.basename(image_path)
+            size_kb = os.path.getsize(image_path) // 1024
+            text = f"[用户发送了一张图片: {filename}, 大小: {size_kb}KB]"
+            self.reset_interrupt_counters()
+            if self._is_responding:
+                await self.cancel_response()
+                await asyncio.sleep(0.3)
+            await self._ws.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            }))
+            await self._ws.send(json.dumps({"type": "response.create"}))
+        except Exception as e:
+            logger.error(f"发送图片失败: {e}")
+
     async def send_audio_file(self, pcm_data: bytes):
         if self._ws and self._running:
             self.reset_interrupt_counters()
