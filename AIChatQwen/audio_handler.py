@@ -50,6 +50,9 @@ class AudioHandler:
         # Minimum durations to confirm speech/silence (avoid false triggers)
         self._min_speech_ms = VAD_MIN_SPEECH_MS
         self._min_silence_ms = VAD_MIN_SILENCE_MS
+        # Echo cancellation: track speaker playback to filter out AI audio
+        self._last_speaker_write_time = 0.0
+        self._echo_tail_ms = 1500  # ignore VAD for this long after speaker stops
 
         # WebRTC VAD for human voice detection
         self._vad = None
@@ -123,12 +126,19 @@ class AudioHandler:
             logger.info("扬声器已停止")
 
     def play_audio(self, data: bytes):
+        import time
         with self._lock:
             if self._spk_stream is not None:
                 try:
                     self._spk_stream.write(data)
+                    self._last_speaker_write_time = time.time()
                 except Exception as e:
                     logger.error(f"播放音频错误: {e}")
+
+    def _is_echo(self) -> bool:
+        """Check if current mic input is likely echo from speaker playback."""
+        import time
+        return (time.time() - self._last_speaker_write_time) * 1000 < self._echo_tail_ms
 
     def _mic_callback(self, in_data, frame_count, time_info, status):
         import time
@@ -141,6 +151,11 @@ class AudioHandler:
 
         # Check human voice via WebRTC VAD
         is_speech = self._has_human_voice(in_data)
+
+        # Echo cancellation: if speaker recently played audio, ignore VAD
+        # (detected "voice" is likely echo from speaker, not real user voice)
+        if is_speech and self._is_echo():
+            is_speech = False
 
         if is_speech:
             self._silence_start_time = 0.0

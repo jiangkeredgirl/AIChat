@@ -63,7 +63,7 @@ SYSTEM_INSTRUCTIONS = (
 )
 
 # Auto mode settings
-AUTO_DISCONNECT_TIMEOUT = 60  # seconds of no voice before auto-disconnect
+AUTO_DISCONNECT_TIMEOUT = 180  # seconds of no voice before auto-disconnect
 VOICE_ENERGY_THRESHOLD = 500  # RMS threshold for voice detection (16-bit PCM)
 
 # AI response auto-interrupt settings
