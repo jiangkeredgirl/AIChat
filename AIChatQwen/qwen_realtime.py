@@ -169,6 +169,8 @@ class QwenRealtimeClient:
         self._cancel_timer()
         self._transcript_buffer = ""
         self._sentence_count = 0
+        self._pending_cancel = False
+        self._pending_reason = ""
 
         if RESPONSE_INTERRUPT_MODE == "timeout":
             self._cancel_task = asyncio.create_task(self._timeout_cancel())
@@ -180,31 +182,33 @@ class QwenRealtimeClient:
             self._cancel_task = None
 
     async def _timeout_cancel(self):
-        """Auto-cancel after timeout seconds."""
+        """After timeout, wait for current sentence to finish then cancel."""
         try:
             await asyncio.sleep(RESPONSE_TIMEOUT_SECONDS)
-            logger.info(f"AI 回复超过 {RESPONSE_TIMEOUT_SECONDS}s，自动打断")
-            await self.cancel_response()
-            if self.on_response_cancelled:
-                self.on_response_cancelled(f"超时 {RESPONSE_TIMEOUT_SECONDS}s")
+            logger.info(f"AI 回复超过 {RESPONSE_TIMEOUT_SECONDS}s，等待当前句子结束后打断")
+            self._pending_cancel = True
+            self._pending_reason = f"超时 {RESPONSE_TIMEOUT_SECONDS}s"
+            # If transcript already ends with punctuation, cancel now
+            if self._transcript_buffer and _SENTENCE_ENDS.search(self._transcript_buffer[-1]):
+                await self._do_pending_cancel()
         except asyncio.CancelledError:
             pass
 
     def _check_sentence_limit(self):
-        """Check if sentence limit reached and cancel if so."""
+        """Check if sentence limit reached, wait for current sentence then cancel."""
         if RESPONSE_INTERRUPT_MODE != "sentences":
             return
         if self._sentence_count >= RESPONSE_MAX_SENTENCES:
-            logger.info(f"AI 回复已达 {self._sentence_count} 句话，自动打断")
-            asyncio.create_task(self._cancel_and_notify("sentences"))
+            logger.info(f"AI 回复已达 {self._sentence_count} 句话，等待当前句子结束后打断")
+            self._pending_cancel = True
+            self._pending_reason = f"已达 {RESPONSE_MAX_SENTENCES} 句话"
 
-    async def _cancel_and_notify(self, reason: str):
+    async def _do_pending_cancel(self):
+        """Execute the pending cancel."""
+        self._pending_cancel = False
         await self.cancel_response()
         if self.on_response_cancelled:
-            if reason == "sentences":
-                self.on_response_cancelled(f"已达 {RESPONSE_MAX_SENTENCES} 句话")
-            else:
-                self.on_response_cancelled(f"超时 {RESPONSE_TIMEOUT_SECONDS}s")
+            self.on_response_cancelled(self._pending_reason)
 
     # ── Event handling ──
 
@@ -249,6 +253,9 @@ class QwenRealtimeClient:
             if new_count > self._sentence_count:
                 self._sentence_count = new_count
                 self._check_sentence_limit()
+            # If pending cancel and current delta ends a sentence, cancel now
+            if self._pending_cancel and _SENTENCE_ENDS.search(delta):
+                asyncio.create_task(self._do_pending_cancel())
 
         elif t == "conversation.item.input_audio_transcription.completed":
             text = event.get("transcript", "")
