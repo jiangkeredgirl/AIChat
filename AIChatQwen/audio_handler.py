@@ -52,7 +52,7 @@ class AudioHandler:
         self._min_silence_ms = VAD_MIN_SILENCE_MS
         # Echo cancellation: track speaker playback to filter out AI audio
         self._last_speaker_write_time = 0.0
-        self._echo_tail_ms = 800  # ignore VAD for this long after speaker stops
+        self._echo_tail_ms = 1500  # ignore VAD for this long after speaker stops
 
         # WebRTC VAD for human voice detection
         self._vad = None
@@ -184,8 +184,9 @@ class AudioHandler:
                     if self.on_speech_state:
                         self.on_speech_state(False)
 
-        # Only send voice audio to API when speech is confirmed
-        if self.on_audio_chunk and self._speech_confirmed:
+        # Send audio to server, but block during echo period
+        # (AI's own audio playing through speakers would be detected as user speech)
+        if self.on_audio_chunk and not self._is_echo():
             self.on_audio_chunk(in_data)
 
         return (None, pyaudio.paContinue)
