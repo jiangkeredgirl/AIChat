@@ -3,5 +3,5 @@
   "workspace_id": "ws-i437mewzddgz4csv",
   "model": "Qwen3.5-Omni Flash (多模态)",
   "voice": "Tina",
-  "turn_detection": "Smart Turn (智能判停)"
+  "turn_detection": "Server VAD (自动)"
 }

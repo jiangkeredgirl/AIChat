@@ -181,11 +181,16 @@ class QwenRealtimeClient:
             filename = os.path.basename(image_path)
 
             if self.is_omni:
-                # Omni model: send real image via input_image_buffer.append
+                # Omni model: must send audio before image (API requirement)
+                silent_audio = base64.b64encode(b'\x00' * 3200).decode()
+                await self._ws.send(json.dumps({
+                    "type": "input_audio_buffer.append",
+                    "audio": silent_audio,
+                }))
+                # Send real image via input_image_buffer.append
                 from PIL import Image
                 import io
                 img = Image.open(image_path)
-                # Resize to fit within 256KB base64 limit (~190KB raw)
                 img.thumbnail((720, 720))
                 buf = io.BytesIO()
                 img.convert("RGB").save(buf, format="JPEG", quality=75)
@@ -237,7 +242,13 @@ class QwenRealtimeClient:
             filename = os.path.basename(video_path)
 
             if self.is_omni:
-                # Omni model: extract frames from video and send
+                # Omni model: must send audio before image (API requirement)
+                silent_audio = base64.b64encode(b'\x00' * 3200).decode()
+                await self._ws.send(json.dumps({
+                    "type": "input_audio_buffer.append",
+                    "audio": silent_audio,
+                }))
+                # Extract frames from video and send
                 import cv2
                 import io
                 cap = cv2.VideoCapture(video_path)
