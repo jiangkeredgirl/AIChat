@@ -9,7 +9,7 @@ import websockets
 
 from config import (
     WS_URL_TEMPLATE, SYSTEM_INSTRUCTIONS,
-    RESPONSE_TIMEOUT_SECONDS, RESPONSE_MAX_SENTENCES,
+    RESPONSE_TIMEOUT_SECONDS, MANUAL_SILENCE_MS,
 )
 
 logger = logging.getLogger(__name__)
@@ -18,7 +18,7 @@ _SENTENCE_ENDS = re.compile(r'[。！？.!?\n]')
 
 
 class QwenRealtimeClient:
-    """Qwen-Audio Realtime API WebSocket client. Server VAD mode."""
+    """Qwen-Audio Realtime API WebSocket client. Supports server_vad / smart_turn / manual."""
 
     def __init__(
         self,
@@ -26,6 +26,7 @@ class QwenRealtimeClient:
         workspace_id: str,
         model: str,
         voice: str = "longanqian",
+        turn_detection: str = "server_vad",
         on_audio_output: Optional[Callable[[bytes], None]] = None,
         on_user_text: Optional[Callable[[str], None]] = None,
         on_ai_text: Optional[Callable[[str], None]] = None,
@@ -40,6 +41,7 @@ class QwenRealtimeClient:
         self.workspace_id = workspace_id
         self.model = model
         self.voice = voice
+        self.turn_detection = turn_detection
         self.on_audio_output = on_audio_output
         self.on_user_text = on_user_text
         self.on_ai_text = on_ai_text
@@ -54,20 +56,36 @@ class QwenRealtimeClient:
         self._running = False
         self._recv_task = None
         self._cancel_task = None
-        self._transcript_buffer = ""
-        self._sentence_count = 0
         self._is_responding = False
         self._cooldown = False
         self._cooldown_task = None
+        self._sentence_count = 0
+        self._transcript_buffer = ""
 
     @property
     def is_responding(self) -> bool:
         return self._is_responding
 
+    @property
+    def is_manual(self) -> bool:
+        return self.turn_detection == "manual"
+
     def _get_url(self) -> str:
         return WS_URL_TEMPLATE.format(
             workspace_id=self.workspace_id, model=self.model
         )
+
+    def _build_turn_detection_config(self) -> dict | None:
+        if self.turn_detection == "server_vad":
+            return {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "silence_duration_ms": 800,
+            }
+        elif self.turn_detection == "smart_turn":
+            return {"type": "smart_turn"}
+        else:  # manual
+            return None
 
     async def connect(self):
         url = self._get_url()
@@ -82,25 +100,22 @@ class QwenRealtimeClient:
         self._running = True
         self._status("已连接，正在配置会话...")
 
+        session = {
+            "modalities": ["text", "audio"],
+            "voice": self.voice,
+            "instructions": SYSTEM_INSTRUCTIONS,
+            "max_history_turns": 5,
+            "turn_detection": self._build_turn_detection_config(),
+            "input_audio_transcription": {"model": ""},
+        }
+
         await self._ws.send(json.dumps({
             "type": "session.update",
-            "session": {
-                "modalities": ["text", "audio"],
-                "voice": self.voice,
-                "instructions": SYSTEM_INSTRUCTIONS,
-                "max_history_turns": 5,
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "silence_duration_ms": 800,
-                },
-                "input_audio_transcription": {
-                    "model": ""
-                },
-            },
+            "session": session,
         }))
 
-        self._status("正在对话...")
+        mode_names = {"server_vad": "Server VAD", "smart_turn": "Smart Turn", "manual": "Manual"}
+        self._status(f"正在对话...（{mode_names.get(self.turn_detection, self.turn_detection)}）")
         self._recv_task = asyncio.create_task(self._recv_loop())
 
     async def disconnect(self):
@@ -128,6 +143,7 @@ class QwenRealtimeClient:
 
     async def send_text(self, text: str):
         if self._ws and self._running and text.strip():
+            self.reset_interrupt_counters()
             if self._is_responding:
                 await self.cancel_response()
             await self._ws.send(json.dumps({
@@ -142,6 +158,7 @@ class QwenRealtimeClient:
 
     async def send_audio_file(self, pcm_data: bytes):
         if self._ws and self._running:
+            self.reset_interrupt_counters()
             if self._is_responding:
                 await self.cancel_response()
             chunk_size = 3200
@@ -153,6 +170,14 @@ class QwenRealtimeClient:
                 }))
                 await asyncio.sleep(0.05)
             await self._ws.send(json.dumps({"type": "response.create"}))
+
+    async def commit_and_respond(self):
+        """Manual mode: commit audio buffer and trigger response."""
+        if self._ws and self._running:
+            self.reset_interrupt_counters()
+            await self._ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+            await self._ws.send(json.dumps({"type": "response.create"}))
+            logger.info("Manual: 已提交音频并请求回复")
 
     async def cancel_response(self):
         if self._ws and self._running and self._is_responding:
@@ -169,12 +194,17 @@ class QwenRealtimeClient:
             except Exception:
                 pass
 
+    def reset_interrupt_counters(self):
+        """Reset timeout and sentence count when new user input arrives."""
+        self._cancel_timer()
+        self._sentence_count = 0
+        self._transcript_buffer = ""
+        logger.info("用户新输入，重置超时和句数计数")
+
     # ── Timeout auto-interrupt ──
 
     def _start_cancel_timer(self):
         self._cancel_timer()
-        self._transcript_buffer = ""
-        self._sentence_count = 0
         self._cancel_task = asyncio.create_task(self._timeout_cancel())
 
     def _cancel_timer(self):
@@ -190,7 +220,7 @@ class QwenRealtimeClient:
         except asyncio.CancelledError:
             pass
 
-    # ── Cooldown after response ──
+    # ── Cooldown ──
 
     def _start_cooldown(self):
         self._cooldown = True
@@ -236,6 +266,8 @@ class QwenRealtimeClient:
             self._is_responding = True
             self._cooldown = False
             self._stop_cooldown()
+            self._sentence_count = 0
+            self._transcript_buffer = ""
             self._start_cancel_timer()
             if self.on_response_start:
                 self.on_response_start()
@@ -244,10 +276,6 @@ class QwenRealtimeClient:
             audio = base64.b64decode(event["delta"])
             if self.on_audio_output:
                 self.on_audio_output(audio)
-
-        elif t == "response.audio_transcript.delta":
-            delta = event.get("delta", "")
-            self._transcript_buffer += delta
 
         elif t == "conversation.item.input_audio_transcription.completed":
             text = event.get("transcript", "")
@@ -262,7 +290,7 @@ class QwenRealtimeClient:
         elif t == "input_audio_buffer.speech_started":
             if self._cooldown:
                 return
-            self._cancel_timer()
+            self.reset_interrupt_counters()
             if self.on_speech_start:
                 self.on_speech_start()
 

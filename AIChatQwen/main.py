@@ -9,7 +9,11 @@ import time
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog
 
-from config import API_KEY, WORKSPACE_ID, MODELS, VOICES, AUTO_DISCONNECT_TIMEOUT, VOICE_ENERGY_THRESHOLD
+from config import (
+    API_KEY, WORKSPACE_ID, MODELS, VOICES,
+    AUTO_DISCONNECT_TIMEOUT, VOICE_ENERGY_THRESHOLD,
+    TURN_DETECTION_MODES, MANUAL_SILENCE_MS,
+)
 from qwen_realtime import QwenRealtimeClient
 from audio_handler import AudioHandler
 
@@ -63,6 +67,7 @@ class App:
 
         # Manual turn control
         self._user_speaking = False
+        self._silence_check_id = None
 
         # Video state
         self.video_capture = None
@@ -97,6 +102,9 @@ class App:
         voice = s.get("voice", "")
         if voice and voice in VOICES:
             self.combo_voice.set(voice)
+        turn = s.get("turn_detection", "")
+        if turn and turn in list(TURN_DETECTION_MODES.keys()):
+            self.combo_turn.set(turn)
 
     def _save_ui_settings(self):
         save_settings({
@@ -104,6 +112,7 @@ class App:
             "workspace_id": self.entry_ws_id.get().strip(),
             "model": self.combo_model.get(),
             "voice": self.combo_voice.get(),
+            "turn_detection": self.combo_turn.get(),
         })
 
     def _build_ui(self):
@@ -141,7 +150,12 @@ class App:
         self.combo_voice.set(VOICES[0])
         self.combo_voice.pack(side=tk.LEFT, padx=(4, 16))
 
-        ttk.Checkbutton(row2, text="自动模式", variable=self.auto_mode).pack(side=tk.LEFT)
+        ttk.Checkbutton(row2, text="自动模式", variable=self.auto_mode).pack(side=tk.LEFT, padx=(0, 16))
+
+        ttk.Label(row2, text="模式:").pack(side=tk.LEFT)
+        self.combo_turn = ttk.Combobox(row2, values=list(TURN_DETECTION_MODES.keys()), state="readonly", width=20)
+        self.combo_turn.set("Server VAD (自动)")
+        self.combo_turn.pack(side=tk.LEFT, padx=(4, 0))
 
         # --- Control frame ---
         ctrl = ttk.Frame(self.root, padding=4)
@@ -373,11 +387,15 @@ class App:
             self.audio.start_speaker()
             self._set_spk("🔊 已启动", "green")
 
+        turn_mode_name = self.combo_turn.get()
+        turn_mode = TURN_DETECTION_MODES.get(turn_mode_name, "server_vad")
+
         self.client = QwenRealtimeClient(
             api_key=api_key,
             workspace_id=ws_id,
             model=model_id,
             voice=voice,
+            turn_detection=turn_mode,
             on_audio_output=self._on_ai_audio,
             on_user_text=self._on_user_text,
             on_ai_text=self._on_ai_text,
@@ -466,11 +484,14 @@ class App:
     # ── Auto mode ──
 
     def _on_speech_state(self, is_speech: bool):
-        """Called by AudioHandler when voice activity state changes.
-        Used for user interrupt: cancel AI when user starts speaking."""
+        """Called by AudioHandler when voice activity state changes."""
         if is_speech:
+            self._user_speaking = True
             self._last_speech_time = time.time()
             self._reconnect_pending = False
+            if self._silence_check_id:
+                self.root.after_cancel(self._silence_check_id)
+                self._silence_check_id = None
             self._set_mic("🎤 说话中...", "#0078D4")
             self.root.after(0, lambda: self.energy_var.set("🎤 说话中..."))
             # User interrupt: cancel AI if responding
@@ -479,8 +500,26 @@ class App:
                     self.client.cancel_response(), self.loop
                 )
         else:
+            self._user_speaking = False
             self._set_mic("🎤 监听中", "green")
             self.root.after(0, lambda: self.energy_var.set(""))
+            # Manual mode: start silence timer to trigger response
+            if self.client and self.client.is_manual and self.connected:
+                if self._silence_check_id:
+                    self.root.after_cancel(self._silence_check_id)
+                self._silence_check_id = self.root.after(
+                    MANUAL_SILENCE_MS, self._on_manual_silence
+                )
+
+    def _on_manual_silence(self):
+        """Manual mode: silence duration passed, commit and respond."""
+        self._silence_check_id = None
+        if self._user_speaking or not self.connected or not self.client:
+            return
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(
+                self.client.commit_and_respond(), self.loop
+            )
 
     def _on_speech_start(self):
         """Called by client on server_vad speech_started event."""

@@ -37,6 +37,14 @@ CHUNK_SIZE = 3200  # 100ms at 16kHz
 VAD_THRESHOLD = 0.5
 SILENCE_DURATION_MS = 800
 
+# Turn detection modes
+TURN_DETECTION_MODES = {
+    "Server VAD (自动)": "server_vad",
+    "Smart Turn (智能判停)": "smart_turn",
+    "Manual (手动)": "manual",
+}
+MANUAL_SILENCE_MS = 1200  # manual mode: silence duration before triggering response
+
 # WebRTC VAD - filters non-human audio (noise, music, etc.)
 # aggressiveness: 0=least aggressive, 3=most aggressive (filter more)
 WEBRTC_VAD_ENABLED = True
