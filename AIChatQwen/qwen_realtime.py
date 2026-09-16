@@ -156,9 +156,12 @@ class QwenRealtimeClient:
     async def send_text(self, text: str):
         if self._ws and self._running and text.strip():
             self.reset_interrupt_counters()
-            if self._is_responding:
-                await self.cancel_response()
-                await asyncio.sleep(0.3)
+            # Always try to cancel any ongoing response
+            try:
+                await self._ws.send(json.dumps({"type": "response.cancel"}))
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
             await self._ws.send(json.dumps({
                 "type": "conversation.item.create",
                 "item": {

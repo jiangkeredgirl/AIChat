@@ -598,6 +598,9 @@ class App:
         self._voice_active = False
 
     def _on_response_start(self):
+        # Clear queued audio from previous response
+        if self.audio:
+            self.audio.clear_playback()
         self._set_spk("🔊 播放中", "#0078D4")
 
     def _on_response_end(self):
@@ -678,8 +681,10 @@ class App:
 
     def _on_mic_chunk(self, data: bytes):
         if self.client and self.connected and self.loop:
-            # Block audio during cooldown to prevent server from detecting echo as user speech
-            if self.client._cooldown:
+            # Block audio during AI response AND cooldown
+            # Server has no echo cancellation, sending audio during AI response
+            # causes server to detect echo as user speech → repeated interruptions
+            if self.client._is_responding or self.client._cooldown:
                 return
             asyncio.run_coroutine_threadsafe(self.client.send_audio(data), self.loop)
 

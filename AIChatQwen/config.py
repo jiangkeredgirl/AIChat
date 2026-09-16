@@ -53,7 +53,7 @@ MANUAL_SILENCE_MS = 800  # manual mode: silence duration before triggering respo
 
 # WebRTC VAD - filters non-human audio (noise, music, etc.)
 # aggressiveness: 0=least aggressive, 3=most aggressive (filter more)
-WEBRTC_VAD_ENABLED = True
+WEBRTC_VAD_ENABLED = False    # 关闭客户端VAD，让服务器处理语音检测
 WEBRTC_VAD_AGGRESSIVENESS = 2   # 从3降到2，减少误过滤
 VAD_ENERGY_THRESHOLD = 100      # 从200降到100，更灵敏
 VAD_MIN_SPEECH_MS = 200         # 从300降到200，更快确认
@@ -73,7 +73,7 @@ SYSTEM_INSTRUCTIONS = (
 AUTO_DISCONNECT_TIMEOUT = 180  # seconds of no voice before auto-disconnect
 VOICE_ENERGY_THRESHOLD = 500  # RMS threshold for voice detection (16-bit PCM)
 
-RESPONSE_COOLDOWN_SECONDS = 0.5  # AI回复结束后冷却期（阻止音频发送，防回声触发假回复）
+RESPONSE_COOLDOWN_SECONDS = 0.2  # AI回复结束后冷却期
 
 # AI response auto-interrupt settings
 # Mode: "timeout" = cancel after N seconds, "sentences" = cancel after N sentences

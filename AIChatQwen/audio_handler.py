@@ -1,6 +1,8 @@
 import logging
 import struct
 import threading
+import queue
+import time
 from typing import Callable, Optional
 
 import pyaudio
@@ -47,14 +49,17 @@ class AudioHandler:
         self._speech_start_time = 0.0
         self._speech_confirmed = False
         self._silence_start_time = 0.0
-        # Minimum durations to confirm speech/silence (avoid false triggers)
         self._min_speech_ms = VAD_MIN_SPEECH_MS
         self._min_silence_ms = VAD_MIN_SILENCE_MS
-        # Echo cancellation: track speaker playback to filter out AI audio
+        # Echo cancellation
         self._last_speaker_write_time = 0.0
-        self._echo_tail_ms = 1500  # ignore VAD for this long after speaker stops
+        self._echo_tail_ms = 1500
+        # Non-blocking audio playback
+        self._audio_queue = queue.Queue()
+        self._playback_thread = None
+        self._playback_running = False
 
-        # WebRTC VAD for human voice detection
+        # WebRTC VAD
         self._vad = None
         if WEBRTC_VAD_ENABLED:
             try:
@@ -62,13 +67,12 @@ class AudioHandler:
                 self._vad = webrtcvad.Vad(WEBRTC_VAD_AGGRESSIVENESS)
                 logger.info(f"WebRTC VAD 已启用 (aggressiveness={WEBRTC_VAD_AGGRESSIVENESS})")
             except Exception as e:
-                logger.warning(f"WebRTC VAD 初始化失败，将不过滤音频: {e}")
+                logger.warning(f"WebRTC VAD 初始化失败: {e}")
                 self._vad = None
 
     def _has_human_voice(self, data: bytes) -> bool:
-        """Check if audio data contains human voice using WebRTC VAD."""
         if self._vad is None:
-            return True  # no VAD, pass everything through
+            return True
         voice_frames = 0
         total_frames = 0
         offset = 0
@@ -83,7 +87,6 @@ class AudioHandler:
             offset += _VAD_FRAME_BYTES
         if total_frames == 0:
             return False
-        # Require at least 30% of frames to be voice
         return (voice_frames / total_frames) >= 0.3
 
     def start_microphone(self):
@@ -116,47 +119,66 @@ class AudioHandler:
             rate=OUTPUT_SAMPLE_RATE,
             output=True,
         )
+        self._playback_running = True
+        self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
+        self._playback_thread.start()
         logger.info("扬声器已启动")
 
+    def _playback_loop(self):
+        """Background thread: plays audio from queue without blocking event loop."""
+        while self._playback_running:
+            try:
+                data = self._audio_queue.get(timeout=0.1)
+                if data is None:
+                    break
+                with self._lock:
+                    if self._spk_stream is not None:
+                        self._spk_stream.write(data)
+                        self._last_speaker_write_time = time.time()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"播放音频错误: {e}")
+
     def stop_speaker(self):
+        self._playback_running = False
+        if self._playback_thread:
+            self._audio_queue.put(None)
+            self._playback_thread.join(timeout=2)
+            self._playback_thread = None
         if self._spk_stream is not None:
             self._spk_stream.stop_stream()
             self._spk_stream.close()
             self._spk_stream = None
-            logger.info("扬声器已停止")
+        logger.info("扬声器已停止")
 
     def play_audio(self, data: bytes):
-        import time
-        with self._lock:
-            if self._spk_stream is not None:
-                try:
-                    self._spk_stream.write(data)
-                    self._last_speaker_write_time = time.time()
-                except Exception as e:
-                    logger.error(f"播放音频错误: {e}")
+        """Non-blocking: queue audio for playback in background thread."""
+        self._audio_queue.put(data)
+
+    def clear_playback(self):
+        """Clear queued audio (e.g., when interrupting AI response)."""
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+            except queue.Empty:
+                break
 
     def _is_echo(self) -> bool:
-        """Check if current mic input is likely echo from speaker playback."""
-        import time
         return (time.time() - self._last_speaker_write_time) * 1000 < self._echo_tail_ms
 
     def _mic_callback(self, in_data, frame_count, time_info, status):
-        import time
         now = time.time()
 
-        # Always report energy for monitoring
         rms = _compute_rms(in_data)
         if self.on_voice_detected:
             self.on_voice_detected(rms)
 
-        # Energy pre-filter: skip VAD for low-energy audio (background noise)
         if rms < VAD_ENERGY_THRESHOLD:
             is_speech = False
         else:
-            # Check human voice via WebRTC VAD
             is_speech = self._has_human_voice(in_data)
 
-        # Echo cancellation: if speaker recently played audio, ignore VAD
         if is_speech and self._is_echo():
             is_speech = False
 
@@ -166,7 +188,6 @@ class AudioHandler:
                 if self._speech_start_time == 0.0:
                     self._speech_start_time = now
                 elif (now - self._speech_start_time) * 1000 >= self._min_speech_ms:
-                    # Speech confirmed after minimum duration
                     self._speech_confirmed = True
                     self._was_speech = True
                     if self.on_speech_state:
@@ -177,7 +198,6 @@ class AudioHandler:
                 if self._silence_start_time == 0.0:
                     self._silence_start_time = now
                 elif (now - self._silence_start_time) * 1000 >= self._min_silence_ms:
-                    # Silence confirmed after minimum duration
                     self._speech_confirmed = False
                     self._was_speech = False
                     self._silence_start_time = 0.0
@@ -185,7 +205,6 @@ class AudioHandler:
                         self.on_speech_state(False)
 
         # Send audio to server, but block during echo period
-        # (AI's own audio playing through speakers would be detected as user speech)
         if self.on_audio_chunk and not self._is_echo():
             self.on_audio_chunk(in_data)
 
