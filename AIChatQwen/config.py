@@ -48,7 +48,7 @@ MANUAL_SILENCE_MS = 1200  # manual mode: silence duration before triggering resp
 # WebRTC VAD - filters non-human audio (noise, music, etc.)
 # aggressiveness: 0=least aggressive, 3=most aggressive (filter more)
 WEBRTC_VAD_ENABLED = True
-WEBRTC_VAD_AGGRESSIVENESS = 2
+WEBRTC_VAD_AGGRESSIVENESS = 3
 
 # System instructions - keep AI responses short
 SYSTEM_INSTRUCTIONS = (

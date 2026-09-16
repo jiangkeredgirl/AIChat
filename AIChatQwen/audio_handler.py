@@ -43,6 +43,12 @@ class AudioHandler:
         self._spk_stream = None
         self._lock = threading.Lock()
         self._was_speech = False
+        self._speech_start_time = 0.0
+        self._speech_confirmed = False
+        self._silence_start_time = 0.0
+        # Minimum durations to confirm speech/silence (avoid false triggers)
+        self._min_speech_ms = 500    # must detect voice for 500ms before reporting "speaking"
+        self._min_silence_ms = 400   # must detect silence for 400ms before reporting "stopped"
 
         # WebRTC VAD for human voice detection
         self._vad = None
@@ -124,6 +130,9 @@ class AudioHandler:
                     logger.error(f"播放音频错误: {e}")
 
     def _mic_callback(self, in_data, frame_count, time_info, status):
+        import time
+        now = time.time()
+
         # Always report energy for monitoring
         if self.on_voice_detected:
             rms = _compute_rms(in_data)
@@ -132,13 +141,32 @@ class AudioHandler:
         # Check human voice via WebRTC VAD
         is_speech = self._has_human_voice(in_data)
 
-        # Report speech state changes
-        if self.on_speech_state and is_speech != self._was_speech:
-            self._was_speech = is_speech
-            self.on_speech_state(is_speech)
+        if is_speech:
+            self._silence_start_time = 0.0
+            if not self._speech_confirmed:
+                if self._speech_start_time == 0.0:
+                    self._speech_start_time = now
+                elif (now - self._speech_start_time) * 1000 >= self._min_speech_ms:
+                    # Speech confirmed after minimum duration
+                    self._speech_confirmed = True
+                    self._was_speech = True
+                    if self.on_speech_state:
+                        self.on_speech_state(True)
+        else:
+            self._speech_start_time = 0.0
+            if self._speech_confirmed:
+                if self._silence_start_time == 0.0:
+                    self._silence_start_time = now
+                elif (now - self._silence_start_time) * 1000 >= self._min_silence_ms:
+                    # Silence confirmed after minimum duration
+                    self._speech_confirmed = False
+                    self._was_speech = False
+                    self._silence_start_time = 0.0
+                    if self.on_speech_state:
+                        self.on_speech_state(False)
 
-        # Only send voice audio to API
-        if self.on_audio_chunk and is_speech:
+        # Only send voice audio to API when speech is confirmed
+        if self.on_audio_chunk and self._speech_confirmed:
             self.on_audio_chunk(in_data)
 
         return (None, pyaudio.paContinue)

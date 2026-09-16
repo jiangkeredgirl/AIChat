@@ -485,6 +485,9 @@ class App:
 
     def _on_speech_state(self, is_speech: bool):
         """Called by AudioHandler when voice activity state changes."""
+        # Ignore all VAD events during AI response or cooldown (prevent echo false triggers)
+        ai_active = (self.client and
+                     (self.client.is_responding or self.client._cooldown))
         if is_speech:
             self._user_speaking = True
             self._last_speech_time = time.time()
@@ -492,14 +495,12 @@ class App:
             if self._silence_check_id:
                 self.root.after_cancel(self._silence_check_id)
                 self._silence_check_id = None
-            # Only show "speaking" and allow interrupt if AI is NOT responding
-            if not self.client or not self.client.is_responding:
+            if not ai_active:
                 self._set_mic("🎤 说话中...", "#0078D4")
                 self.root.after(0, lambda: self.energy_var.set("🎤 说话中..."))
-            # Do NOT interrupt AI by voice - only text input can interrupt
         else:
             self._user_speaking = False
-            if not self.client or not self.client.is_responding:
+            if not ai_active:
                 self._set_mic("🎤 监听中", "green")
                 self.root.after(0, lambda: self.energy_var.set(""))
             # Manual mode: start silence timer only if not in cooldown
