@@ -10,7 +10,8 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog
 
 from config import (
-    API_KEY, WORKSPACE_ID, MODELS, VOICES,
+    API_KEY, WORKSPACE_ID, MODELS, OMNI_MODELS,
+    VOICES_AUDIO, VOICES_OMNI,
     AUTO_DISCONNECT_TIMEOUT, VOICE_ENERGY_THRESHOLD,
     TURN_DETECTION_MODES, MANUAL_SILENCE_MS,
 )
@@ -99,12 +100,33 @@ class App:
         model = s.get("model", "")
         if model and model in list(MODELS.keys()):
             self.combo_model.set(model)
+        # Update voice list based on model, then restore saved voice
+        self._update_voice_list()
         voice = s.get("voice", "")
-        if voice and voice in VOICES:
+        voices = self._current_voices()
+        if voice and voice in voices:
             self.combo_voice.set(voice)
         turn = s.get("turn_detection", "")
         if turn and turn in list(TURN_DETECTION_MODES.keys()):
             self.combo_turn.set(turn)
+
+    def _current_voices(self):
+        """Return the voice list for the currently selected model."""
+        model_id = MODELS.get(self.combo_model.get(), "")
+        if model_id in OMNI_MODELS:
+            return VOICES_OMNI
+        return VOICES_AUDIO
+
+    def _update_voice_list(self):
+        """Update voice combobox values based on selected model."""
+        voices = self._current_voices()
+        self.combo_voice.configure(values=voices)
+        if self.combo_voice.get() not in voices:
+            self.combo_voice.set(voices[0])
+
+    def _on_model_changed(self, event=None):
+        """Called when model selection changes."""
+        self._update_voice_list()
 
     def _save_ui_settings(self):
         save_settings({
@@ -142,12 +164,13 @@ class App:
         row2.pack(fill=tk.X, pady=2)
         ttk.Label(row2, text="模型:").pack(side=tk.LEFT)
         self.combo_model = ttk.Combobox(row2, values=list(MODELS.keys()), state="readonly", width=20)
-        self.combo_model.set("Plus (高质量)")
+        self.combo_model.set("Qwen3.5-Omni Plus (多模态)")
+        self.combo_model.bind("<<ComboboxSelected>>", self._on_model_changed)
         self.combo_model.pack(side=tk.LEFT, padx=(4, 16))
 
         ttk.Label(row2, text="音色:").pack(side=tk.LEFT)
-        self.combo_voice = ttk.Combobox(row2, values=VOICES, state="readonly", width=16)
-        self.combo_voice.set(VOICES[0])
+        self.combo_voice = ttk.Combobox(row2, values=VOICES_OMNI, state="readonly", width=16)
+        self.combo_voice.set(VOICES_OMNI[0])
         self.combo_voice.pack(side=tk.LEFT, padx=(4, 16))
 
         ttk.Checkbutton(row2, text="自动模式", variable=self.auto_mode).pack(side=tk.LEFT, padx=(0, 16))

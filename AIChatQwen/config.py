@@ -10,20 +10,26 @@ WS_URL_TEMPLATE = "wss://{workspace_id}.cn-beijing.maas.aliyuncs.com/api-ws/v1/r
 
 # Available models
 MODELS = {
-    "Plus (高质量)": "qwen-audio-3.0-realtime-plus",
-    "Flash (低延迟)": "qwen-audio-3.0-realtime-flash",
+    "Qwen3.5-Omni Plus (多模态)": "qwen3.5-omni-plus-realtime",
+    "Qwen3.5-Omni Flash (多模态)": "qwen3.5-omni-flash-realtime",
+    "Qwen-Audio Plus (语音)": "qwen-audio-3.0-realtime-plus",
+    "Qwen-Audio Flash (语音)": "qwen-audio-3.0-realtime-flash",
 }
 
+# Omni models support image/video input
+OMNI_MODELS = {"qwen3.5-omni-plus-realtime", "qwen3.5-omni-flash-realtime"}
+
 # Available voices
-VOICES = [
-    "longanqian",
-    "longanying",
-    "longanrou",
-    "longanjing",
-    "longanxin",
-    "longanxia",
-    "longanming",
-    "longanyue",
+VOICES_AUDIO = [
+    "longanqian", "longanying", "longanrou", "longanjing",
+    "longanxin", "longanxia", "longanming", "longanyue",
+]
+
+VOICES_OMNI = [
+    "Tina", "Ethan", "Cindy", "Raymond", "Serena", "Harvey", "Maia", "Evan",
+    "Qiao", "Momo", "Wil", "Angel", "Mia", "Gold", "Katerina", "Ryan",
+    "Jennifer", "Aiden", "Mione", "Sunny", "Dylan", "Eric", "Peter",
+    "Kiki", "Rocky", "Sohee", "Lenn", "Chloe",
 ]
 
 # Audio settings

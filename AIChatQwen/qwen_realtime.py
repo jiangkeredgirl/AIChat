@@ -11,6 +11,7 @@ import websockets
 from config import (
     WS_URL_TEMPLATE, SYSTEM_INSTRUCTIONS,
     RESPONSE_TIMEOUT_SECONDS, MANUAL_SILENCE_MS,
+    OMNI_MODELS,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,10 @@ class QwenRealtimeClient:
     @property
     def is_manual(self) -> bool:
         return self.turn_detection == "manual"
+
+    @property
+    def is_omni(self) -> bool:
+        return self.model in OMNI_MODELS
 
     @property
     def in_protection_period(self) -> bool:
@@ -168,52 +173,136 @@ class QwenRealtimeClient:
             await self._ws.send(json.dumps({"type": "response.create"}))
 
     async def send_image(self, image_path: str):
-        """Send image info as text (audio model doesn't support image input)."""
+        """Send image. Omni models: input_image_buffer.append. Audio models: text description."""
         if not self._ws or not self._running:
             return
         try:
             import os
             filename = os.path.basename(image_path)
-            size_kb = os.path.getsize(image_path) // 1024
-            text = f"[用户发送了一张图片: {filename}, 大小: {size_kb}KB]"
-            self.reset_interrupt_counters()
-            if self._is_responding:
-                await self.cancel_response()
-                await asyncio.sleep(0.3)
-            await self._ws.send(json.dumps({
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": text}],
-                },
-            }))
-            await self._ws.send(json.dumps({"type": "response.create"}))
+
+            if self.is_omni:
+                # Omni model: send real image via input_image_buffer.append
+                from PIL import Image
+                import io
+                img = Image.open(image_path)
+                # Resize to fit within 256KB base64 limit (~190KB raw)
+                img.thumbnail((720, 720))
+                buf = io.BytesIO()
+                img.convert("RGB").save(buf, format="JPEG", quality=75)
+                image_data = base64.b64encode(buf.getvalue()).decode()
+                await self._ws.send(json.dumps({
+                    "type": "input_image_buffer.append",
+                    "image": image_data,
+                }))
+                # Send text context so AI knows what was sent
+                await self._ws.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text",
+                                     "text": f"[用户发送了一张图片: {filename}]"}],
+                    },
+                }))
+                await self._ws.send(json.dumps({"type": "response.create"}))
+                logger.info(f"Omni: 已发送图片 {filename}")
+            else:
+                # Audio model: send as text description
+                size_kb = os.path.getsize(image_path) // 1024
+                text = f"[用户发送了一张图片: {filename}, 大小: {size_kb}KB]"
+                self.reset_interrupt_counters()
+                if self._is_responding:
+                    await self.cancel_response()
+                    await asyncio.sleep(0.3)
+                await self._ws.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                }))
+                await self._ws.send(json.dumps({"type": "response.create"}))
+                logger.info(f"Audio: 已发送图片描述 {filename}")
         except Exception as e:
             logger.error(f"发送图片失败: {e}")
 
     async def send_video(self, video_path: str):
-        """Send video file info as text (audio model doesn't support video input)."""
+        """Send video. Omni models: extract frames and send via input_image_buffer.append.
+        Audio models: send as text description."""
         if not self._ws or not self._running:
             return
         try:
             import os
             filename = os.path.basename(video_path)
-            size_mb = os.path.getsize(video_path) / (1024 * 1024)
-            text = f"[用户发送了一个视频文件: {filename}, 大小: {size_mb:.1f}MB]"
-            self.reset_interrupt_counters()
-            if self._is_responding:
-                await self.cancel_response()
-                await asyncio.sleep(0.3)
-            await self._ws.send(json.dumps({
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": text}],
-                },
-            }))
-            await self._ws.send(json.dumps({"type": "response.create"}))
+
+            if self.is_omni:
+                # Omni model: extract frames from video and send
+                import cv2
+                import io
+                cap = cv2.VideoCapture(video_path)
+                fps = cap.get(cv2.CAP_PROP_FPS) or 25
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                duration = total_frames / fps if fps > 0 else 0
+                # Extract 1 frame per second, max 60 frames
+                frame_interval = max(1, int(fps))
+                frame_count = 0
+                sent = 0
+                max_frames = min(60, int(duration))
+                while sent < max_frames:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count)
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frame_count += frame_interval
+                    # Resize and encode as JPEG
+                    h, w = frame.shape[:2]
+                    if max(h, w) > 720:
+                        scale = 720 / max(h, w)
+                        frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+                    _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    jpg_bytes = jpg.tobytes()
+                    if len(jpg_bytes) > 256 * 1024:
+                        continue  # skip if too large
+                    image_data = base64.b64encode(jpg_bytes).decode()
+                    await self._ws.send(json.dumps({
+                        "type": "input_image_buffer.append",
+                        "image": image_data,
+                    }))
+                    sent += 1
+                    await asyncio.sleep(0.1)  # small delay between frames
+                cap.release()
+                # Send text context
+                await self._ws.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text",
+                                     "text": f"[用户发送了一个视频: {filename}, "
+                                             f"时长: {duration:.1f}秒, 提取了{sent}帧]"}],
+                    },
+                }))
+                await self._ws.send(json.dumps({"type": "response.create"}))
+                logger.info(f"Omni: 已发送视频 {filename}, {sent}帧")
+            else:
+                # Audio model: send as text description
+                size_mb = os.path.getsize(video_path) / (1024 * 1024)
+                text = f"[用户发送了一个视频文件: {filename}, 大小: {size_mb:.1f}MB]"
+                self.reset_interrupt_counters()
+                if self._is_responding:
+                    await self.cancel_response()
+                    await asyncio.sleep(0.3)
+                await self._ws.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                }))
+                await self._ws.send(json.dumps({"type": "response.create"}))
+                logger.info(f"Audio: 已发送视频描述 {filename}")
         except Exception as e:
             logger.error(f"发送视频失败: {e}")
 
