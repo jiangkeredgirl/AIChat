@@ -169,6 +169,14 @@ class App:
         self.log_var = tk.StringVar(value="就绪")
         ttk.Label(bar, textvariable=self.log_var, foreground="gray").pack(side=tk.LEFT, padx=8, pady=4)
 
+        self.mic_var = tk.StringVar(value="🎤 --")
+        self.mic_label = ttk.Label(bar, textvariable=self.mic_var, foreground="gray")
+        self.mic_label.pack(side=tk.RIGHT, padx=8, pady=4)
+
+        self.spk_var = tk.StringVar(value="🔊 --")
+        self.spk_label = ttk.Label(bar, textvariable=self.spk_var, foreground="gray")
+        self.spk_label.pack(side=tk.RIGHT, padx=8, pady=4)
+
     def _append_chat(self, role: str, text: str):
         self.text_chat.configure(state=tk.NORMAL)
         if role == "user":
@@ -186,6 +194,12 @@ class App:
 
     def _set_log(self, text: str):
         self.root.after(0, lambda: self.log_var.set(text))
+
+    def _set_mic(self, text: str, color: str = "gray"):
+        self.root.after(0, lambda: (self.mic_var.set(text), self.mic_label.configure(foreground=color)))
+
+    def _set_spk(self, text: str, color: str = "gray"):
+        self.root.after(0, lambda: (self.spk_var.set(text), self.spk_label.configure(foreground=color)))
 
     # ── Connection ──
 
@@ -217,6 +231,7 @@ class App:
                 on_voice_detected=self._on_voice_energy,
             )
             self.audio.start_speaker()
+            self._set_spk("🔊 已启动", "green")
 
         self.client = QwenRealtimeClient(
             api_key=api_key,
@@ -231,6 +246,8 @@ class App:
             on_speech_start=self._on_speech_start,
             on_speech_end=self._on_speech_end,
             on_response_cancelled=self._on_response_cancelled,
+            on_response_start=self._on_response_start,
+            on_response_end=self._on_response_end,
         )
 
         if self.loop is None:
@@ -249,7 +266,11 @@ class App:
         self.connected = True
         self._last_speech_time = time.time()
         self._reconnect_pending = False
+        self._mic_always_on = False
         self.root.after(0, self._update_buttons_connected)
+        if self.audio:
+            self.audio.start_microphone()
+            self._set_mic("🎤 监听中", "green")
         self._append_chat("system", "连接成功，开始对话吧！")
         self._start_auto_check()
 
@@ -281,6 +302,8 @@ class App:
 
         self.client = None
         self.root.after(0, self._update_buttons_disconnected)
+        self._set_mic("🎤 已停止", "gray")
+        self._set_spk("🔊 已停止", "gray")
         msg = "已断开连接"
         if reason:
             msg = f"已断开连接（{reason}）"
@@ -298,6 +321,8 @@ class App:
             except Exception:
                 pass
             self.audio = None
+        self._set_mic("🎤 --", "gray")
+        self._set_spk("🔊 --", "gray")
 
     # ── Auto mode ──
 
@@ -305,15 +330,23 @@ class App:
         self._last_speech_time = time.time()
         self._voice_active = True
         self._reconnect_pending = False
+        self._set_mic("🎤 说话中...", "#0078D4")
         self.root.after(0, lambda: self.energy_var.set("🎤 说话中..."))
 
     def _on_speech_end(self):
         self._last_speech_time = time.time()
         self._voice_active = False
+        self._set_mic("🎤 监听中", "green")
         self.root.after(0, lambda: self.energy_var.set(""))
 
     def _on_response_cancelled(self, reason: str):
         self._append_chat("system", f"（AI 回复已自动截断: {reason}）")
+
+    def _on_response_start(self):
+        self._set_spk("🔊 播放中", "#0078D4")
+
+    def _on_response_end(self):
+        self._set_spk("🔊 已启动", "green")
 
     def _on_voice_energy(self, rms: float):
         if not self.auto_mode.get():
@@ -382,8 +415,10 @@ class App:
                 on_voice_detected=self._on_voice_energy,
             )
             self.audio.start_speaker()
+            self._set_spk("🔊 已启动", "green")
         try:
             self.audio.start_microphone()
+            self._set_mic("🎤 监听中", "green")
         except Exception:
             pass
         self._set_status("自动监听中...")

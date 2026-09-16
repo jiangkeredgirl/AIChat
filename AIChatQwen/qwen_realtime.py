@@ -35,6 +35,8 @@ class QwenRealtimeClient:
         on_speech_start: Optional[Callable[[], None]] = None,
         on_speech_end: Optional[Callable[[], None]] = None,
         on_response_cancelled: Optional[Callable[[str], None]] = None,
+        on_response_start: Optional[Callable[[], None]] = None,
+        on_response_end: Optional[Callable[[], None]] = None,
     ):
         self.api_key = api_key
         self.workspace_id = workspace_id
@@ -48,6 +50,8 @@ class QwenRealtimeClient:
         self.on_speech_start = on_speech_start
         self.on_speech_end = on_speech_end
         self.on_response_cancelled = on_response_cancelled
+        self.on_response_start = on_response_start
+        self.on_response_end = on_response_end
 
         self._ws = None
         self._running = False
@@ -197,6 +201,8 @@ class QwenRealtimeClient:
 
         if t == "response.created":
             self._start_cancel_timer()
+            if self.on_response_start:
+                self.on_response_start()
 
         elif t == "response.audio.delta":
             audio = base64.b64decode(event["delta"])
@@ -233,9 +239,13 @@ class QwenRealtimeClient:
 
         elif t == "response.done":
             self._cancel_timer()
+            if self.on_response_end:
+                self.on_response_end()
 
         elif t == "response.cancelled":
             self._cancel_timer()
+            if self.on_response_end:
+                self.on_response_end()
 
         elif t == "error":
             self._cancel_timer()
