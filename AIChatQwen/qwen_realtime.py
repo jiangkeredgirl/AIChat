@@ -9,17 +9,16 @@ import websockets
 
 from config import (
     WS_URL_TEMPLATE, SYSTEM_INSTRUCTIONS,
-    RESPONSE_INTERRUPT_MODE, RESPONSE_TIMEOUT_SECONDS, RESPONSE_MAX_SENTENCES,
+    RESPONSE_TIMEOUT_SECONDS, RESPONSE_MAX_SENTENCES,
 )
 
 logger = logging.getLogger(__name__)
 
-# Sentence-ending punctuation for counting
 _SENTENCE_ENDS = re.compile(r'[。！？.!?\n]')
 
 
 class QwenRealtimeClient:
-    """Qwen-Audio Realtime API WebSocket client."""
+    """Qwen-Audio Realtime API WebSocket client. Manual turn detection."""
 
     def __init__(
         self,
@@ -32,9 +31,6 @@ class QwenRealtimeClient:
         on_ai_text: Optional[Callable[[str], None]] = None,
         on_status: Optional[Callable[[str], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
-        on_speech_start: Optional[Callable[[], None]] = None,
-        on_speech_end: Optional[Callable[[], None]] = None,
-        on_response_cancelled: Optional[Callable[[str], None]] = None,
         on_response_start: Optional[Callable[[], None]] = None,
         on_response_end: Optional[Callable[[], None]] = None,
     ):
@@ -47,9 +43,6 @@ class QwenRealtimeClient:
         self.on_ai_text = on_ai_text
         self.on_status = on_status
         self.on_error = on_error
-        self.on_speech_start = on_speech_start
-        self.on_speech_end = on_speech_end
-        self.on_response_cancelled = on_response_cancelled
         self.on_response_start = on_response_start
         self.on_response_end = on_response_end
 
@@ -59,8 +52,11 @@ class QwenRealtimeClient:
         self._cancel_task = None
         self._transcript_buffer = ""
         self._sentence_count = 0
-        self._cooldown = False
-        self._cooldown_task = None
+        self._is_responding = False
+
+    @property
+    def is_responding(self) -> bool:
+        return self._is_responding
 
     def _get_url(self) -> str:
         return WS_URL_TEMPLATE.format(
@@ -80,6 +76,7 @@ class QwenRealtimeClient:
         self._running = True
         self._status("已连接，正在配置会话...")
 
+        # turn_detection: null = manual mode, no auto-response
         await self._ws.send(json.dumps({
             "type": "session.update",
             "session": {
@@ -87,23 +84,14 @@ class QwenRealtimeClient:
                 "voice": self.voice,
                 "instructions": SYSTEM_INSTRUCTIONS,
                 "max_history_turns": 5,
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "silence_duration_ms": 800,
-                },
+                "turn_detection": None,
                 "input_audio_transcription": {
                     "model": ""
                 },
             },
         }))
 
-        mode_desc = (
-            f"{RESPONSE_TIMEOUT_SECONDS}秒超时"
-            if RESPONSE_INTERRUPT_MODE == "timeout"
-            else f"超过{RESPONSE_MAX_SENTENCES}句话"
-        )
-        self._status(f"正在对话...（打断方式: {mode_desc}）")
+        self._status("正在对话...")
         self._recv_task = asyncio.create_task(self._recv_loop())
 
     async def disconnect(self):
@@ -118,9 +106,11 @@ class QwenRealtimeClient:
             except Exception:
                 pass
             self._ws = None
+        self._is_responding = False
         self._status("已断开连接")
 
     async def send_audio(self, pcm_data: bytes):
+        """Send audio chunk to API buffer."""
         if self._ws and self._running:
             await self._ws.send(json.dumps({
                 "type": "input_audio_buffer.append",
@@ -128,8 +118,11 @@ class QwenRealtimeClient:
             }))
 
     async def send_text(self, text: str):
-        """Send a text message to the AI."""
+        """Send a text message and trigger response."""
         if self._ws and self._running and text.strip():
+            # If AI is responding, cancel first
+            if self._is_responding:
+                await self.cancel_response()
             await self._ws.send(json.dumps({
                 "type": "conversation.item.create",
                 "item": {
@@ -143,6 +136,8 @@ class QwenRealtimeClient:
     async def send_audio_file(self, pcm_data: bytes):
         """Send raw PCM audio data (from a file) to the API."""
         if self._ws and self._running:
+            if self._is_responding:
+                await self.cancel_response()
             chunk_size = 3200
             for i in range(0, len(pcm_data), chunk_size):
                 chunk = pcm_data[i:i + chunk_size]
@@ -151,30 +146,40 @@ class QwenRealtimeClient:
                     "audio": base64.b64encode(chunk).decode(),
                 }))
                 await asyncio.sleep(0.05)
+            await self._ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
             await self._ws.send(json.dumps({"type": "response.create"}))
 
-    async def cancel_response(self):
-        """Send response.cancel to stop the current AI response."""
+    async def commit_and_respond(self):
+        """Commit audio buffer and trigger AI response. Manual turn control."""
         if self._ws and self._running:
+            await self._ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+            await self._ws.send(json.dumps({"type": "response.create"}))
+            logger.info("已提交音频并请求回复")
+
+    async def cancel_response(self):
+        """Cancel current AI response."""
+        if self._ws and self._running and self._is_responding:
             try:
                 await self._ws.send(json.dumps({"type": "response.cancel"}))
-                logger.info("已发送 response.cancel")
+                logger.info("已打断 AI 回复")
             except Exception as e:
                 logger.error(f"发送 cancel 失败: {e}")
 
-    # ── Interrupt timer / sentence counter ──
+    async def clear_audio_buffer(self):
+        """Clear the input audio buffer."""
+        if self._ws and self._running:
+            try:
+                await self._ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+            except Exception:
+                pass
+
+    # ── Timeout auto-interrupt ──
 
     def _start_cancel_timer(self):
-        """Start the interrupt mechanism based on configured mode."""
         self._cancel_timer()
         self._transcript_buffer = ""
         self._sentence_count = 0
-        self._pending_cancel = False
-        self._pending_reason = ""
-
-        if RESPONSE_INTERRUPT_MODE == "timeout":
-            self._cancel_task = asyncio.create_task(self._timeout_cancel())
-        # "sentences" mode: no timer needed, counted in _handle_event
+        self._cancel_task = asyncio.create_task(self._timeout_cancel())
 
     def _cancel_timer(self):
         if self._cancel_task:
@@ -182,33 +187,12 @@ class QwenRealtimeClient:
             self._cancel_task = None
 
     async def _timeout_cancel(self):
-        """After timeout, wait for current sentence to finish then cancel."""
         try:
             await asyncio.sleep(RESPONSE_TIMEOUT_SECONDS)
-            logger.info(f"AI 回复超过 {RESPONSE_TIMEOUT_SECONDS}s，等待当前句子结束后打断")
-            self._pending_cancel = True
-            self._pending_reason = f"超时 {RESPONSE_TIMEOUT_SECONDS}s"
-            # If transcript already ends with punctuation, cancel now
-            if self._transcript_buffer and _SENTENCE_ENDS.search(self._transcript_buffer[-1]):
-                await self._do_pending_cancel()
+            logger.info(f"AI 回复超过 {RESPONSE_TIMEOUT_SECONDS}s，打断")
+            await self.cancel_response()
         except asyncio.CancelledError:
             pass
-
-    def _check_sentence_limit(self):
-        """Check if sentence limit reached, wait for current sentence then cancel."""
-        if RESPONSE_INTERRUPT_MODE != "sentences":
-            return
-        if self._sentence_count >= RESPONSE_MAX_SENTENCES:
-            logger.info(f"AI 回复已达 {self._sentence_count} 句话，等待当前句子结束后打断")
-            self._pending_cancel = True
-            self._pending_reason = f"已达 {RESPONSE_MAX_SENTENCES} 句话"
-
-    async def _do_pending_cancel(self):
-        """Execute the pending cancel."""
-        self._pending_cancel = False
-        await self.cancel_response()
-        if self.on_response_cancelled:
-            self.on_response_cancelled(self._pending_reason)
 
     # ── Event handling ──
 
@@ -232,11 +216,8 @@ class QwenRealtimeClient:
         t = event.get("type", "")
 
         if t == "response.created":
+            self._is_responding = True
             self._start_cancel_timer()
-            self._cooldown = False
-            if self._cooldown_task:
-                self._cooldown_task.cancel()
-                self._cooldown_task = None
             if self.on_response_start:
                 self.on_response_start()
 
@@ -246,16 +227,11 @@ class QwenRealtimeClient:
                 self.on_audio_output(audio)
 
         elif t == "response.audio_transcript.delta":
-            # Accumulate transcript and count sentences
             delta = event.get("delta", "")
             self._transcript_buffer += delta
             new_count = len(_SENTENCE_ENDS.findall(self._transcript_buffer))
             if new_count > self._sentence_count:
                 self._sentence_count = new_count
-                self._check_sentence_limit()
-            # If pending cancel and current delta ends a sentence, cancel now
-            if self._pending_cancel and _SENTENCE_ENDS.search(delta):
-                asyncio.create_task(self._do_pending_cancel())
 
         elif t == "conversation.item.input_audio_transcription.completed":
             text = event.get("transcript", "")
@@ -267,61 +243,22 @@ class QwenRealtimeClient:
             if text and self.on_ai_text:
                 self.on_ai_text(text)
 
-        elif t == "input_audio_buffer.speech_started":
-            if self._cooldown:
-                logger.info("冷却期中，忽略语音输入")
-                return
-            self._cancel_timer()
-            if self.on_speech_start:
-                self.on_speech_start()
-
-        elif t == "input_audio_buffer.speech_stopped":
-            if self._cooldown:
-                return
-            if self.on_speech_end:
-                self.on_speech_end()
-
         elif t == "response.done":
+            self._is_responding = False
             self._cancel_timer()
             if self.on_response_end:
                 self.on_response_end()
-            self._start_cooldown()
 
         elif t == "response.cancelled":
+            self._is_responding = False
             self._cancel_timer()
             if self.on_response_end:
                 self.on_response_end()
-            self._start_cooldown()
 
         elif t == "error":
             self._cancel_timer()
             msg = event.get("error", {}).get("message", "未知错误")
             self._error(f"服务端错误: {msg}")
-
-    def _start_cooldown(self):
-        """After AI responds, enter cooldown to prevent self-talking loops."""
-        self._cooldown = True
-        if self._cooldown_task:
-            self._cooldown_task.cancel()
-        self._cooldown_task = asyncio.create_task(self._cooldown_timer())
-        # Clear audio buffer to prevent accumulated audio from triggering response
-        asyncio.create_task(self._clear_audio_buffer())
-
-    async def _cooldown_timer(self):
-        try:
-            await asyncio.sleep(3)
-            self._cooldown = False
-            logger.info("冷却期结束，恢复语音输入")
-        except asyncio.CancelledError:
-            pass
-
-    async def _clear_audio_buffer(self):
-        """Clear the input audio buffer to prevent stale audio from triggering responses."""
-        if self._ws and self._running:
-            try:
-                await self._ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
-            except Exception:
-                pass
 
     def _status(self, msg: str):
         logger.info(msg)

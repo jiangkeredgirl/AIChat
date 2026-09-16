@@ -33,13 +33,16 @@ class AudioHandler:
         self,
         on_audio_chunk: Optional[Callable[[bytes], None]] = None,
         on_voice_detected: Optional[Callable[[float], None]] = None,
+        on_speech_state: Optional[Callable[[bool], None]] = None,
     ):
         self.on_audio_chunk = on_audio_chunk
         self.on_voice_detected = on_voice_detected
+        self.on_speech_state = on_speech_state
         self._pa = pyaudio.PyAudio()
         self._mic_stream = None
         self._spk_stream = None
         self._lock = threading.Lock()
+        self._was_speech = False
 
         # WebRTC VAD for human voice detection
         self._vad = None
@@ -126,10 +129,17 @@ class AudioHandler:
             rms = _compute_rms(in_data)
             self.on_voice_detected(rms)
 
-        # Only send to API if human voice is detected
-        if self.on_audio_chunk:
-            if self._has_human_voice(in_data):
-                self.on_audio_chunk(in_data)
+        # Check human voice via WebRTC VAD
+        is_speech = self._has_human_voice(in_data)
+
+        # Report speech state changes
+        if self.on_speech_state and is_speech != self._was_speech:
+            self._was_speech = is_speech
+            self.on_speech_state(is_speech)
+
+        # Only send voice audio to API
+        if self.on_audio_chunk and is_speech:
+            self.on_audio_chunk(in_data)
 
         return (None, pyaudio.paContinue)
 
