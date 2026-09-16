@@ -37,15 +37,19 @@ CHUNK_SIZE = 3200  # 100ms at 16kHz
 VAD_THRESHOLD = 0.5
 SILENCE_DURATION_MS = 800
 
+# WebRTC VAD - filters non-human audio (noise, music, etc.)
+# aggressiveness: 0=least aggressive, 3=most aggressive (filter more)
+WEBRTC_VAD_ENABLED = True
+WEBRTC_VAD_AGGRESSIVENESS = 2
+
 # System instructions - keep AI responses short
 SYSTEM_INSTRUCTIONS = (
-    "你是语音助手，必须严格遵守以下规则：\n"
-    "1. 每次回答绝对不能超过3句话，最好只说1句。\n"
-    "2. 每句话不超过15个字。\n"
-    "3. 禁止使用列表、编号、解释、举例。\n"
-    "4. 不要重复用户的问题，直接给答案。\n"
-    "5. 像发微信短消息一样说话，能少说就少说。\n"
-    "6. 如果用户没说话或只是语气词，简单回应即可，不要主动展开话题。"
+    "你是语音助手，请用自然口语回答问题，遵守以下规则：\n"
+    "1. 每次回答2到5句话，每句话不超过100个字，把问题说清楚即可，不要啰嗦。\n"
+    "2. 禁止使用列表、编号、markdown格式。\n"
+    "3. 不要重复用户的问题，直接回答。\n"
+    "4. 语气自然亲切，像朋友聊天。\n"
+    "5. 如果用户没说话或只是语气词，简单回应即可。"
 )
 
 # Auto mode settings
@@ -55,5 +59,5 @@ VOICE_ENERGY_THRESHOLD = 500  # RMS threshold for voice detection (16-bit PCM)
 # AI response auto-interrupt settings
 # Mode: "timeout" = cancel after N seconds, "sentences" = cancel after N sentences
 RESPONSE_INTERRUPT_MODE = "timeout"   # "timeout" or "sentences"
-RESPONSE_TIMEOUT_SECONDS = 10         # used when mode is "timeout"
-RESPONSE_MAX_SENTENCES = 3            # used when mode is "sentences"
+RESPONSE_TIMEOUT_SECONDS = 60         # used when mode is "timeout"
+RESPONSE_MAX_SENTENCES = 5            # used when mode is "sentences"

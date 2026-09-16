@@ -5,9 +5,15 @@ from typing import Callable, Optional
 
 import pyaudio
 
-from config import INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE, CHANNELS, CHUNK_SIZE
+from config import (
+    INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE, CHANNELS, CHUNK_SIZE,
+    WEBRTC_VAD_ENABLED, WEBRTC_VAD_AGGRESSIVENESS,
+)
 
 logger = logging.getLogger(__name__)
+
+# WebRTC VAD frame size: 30ms at 16kHz = 480 samples = 960 bytes
+_VAD_FRAME_BYTES = 960
 
 
 def _compute_rms(data: bytes) -> float:
@@ -34,6 +40,38 @@ class AudioHandler:
         self._mic_stream = None
         self._spk_stream = None
         self._lock = threading.Lock()
+
+        # WebRTC VAD for human voice detection
+        self._vad = None
+        if WEBRTC_VAD_ENABLED:
+            try:
+                import webrtcvad
+                self._vad = webrtcvad.Vad(WEBRTC_VAD_AGGRESSIVENESS)
+                logger.info(f"WebRTC VAD 已启用 (aggressiveness={WEBRTC_VAD_AGGRESSIVENESS})")
+            except Exception as e:
+                logger.warning(f"WebRTC VAD 初始化失败，将不过滤音频: {e}")
+                self._vad = None
+
+    def _has_human_voice(self, data: bytes) -> bool:
+        """Check if audio data contains human voice using WebRTC VAD."""
+        if self._vad is None:
+            return True  # no VAD, pass everything through
+        voice_frames = 0
+        total_frames = 0
+        offset = 0
+        while offset + _VAD_FRAME_BYTES <= len(data):
+            frame = data[offset:offset + _VAD_FRAME_BYTES]
+            total_frames += 1
+            try:
+                if self._vad.is_speech(frame, INPUT_SAMPLE_RATE):
+                    voice_frames += 1
+            except Exception:
+                pass
+            offset += _VAD_FRAME_BYTES
+        if total_frames == 0:
+            return False
+        # Require at least 30% of frames to be voice
+        return (voice_frames / total_frames) >= 0.3
 
     def start_microphone(self):
         if self._mic_stream is not None:
@@ -83,11 +121,16 @@ class AudioHandler:
                     logger.error(f"播放音频错误: {e}")
 
     def _mic_callback(self, in_data, frame_count, time_info, status):
+        # Always report energy for monitoring
         if self.on_voice_detected:
             rms = _compute_rms(in_data)
             self.on_voice_detected(rms)
+
+        # Only send to API if human voice is detected
         if self.on_audio_chunk:
-            self.on_audio_chunk(in_data)
+            if self._has_human_voice(in_data):
+                self.on_audio_chunk(in_data)
+
         return (None, pyaudio.paContinue)
 
     def shutdown(self):

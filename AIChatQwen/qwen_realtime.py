@@ -59,6 +59,8 @@ class QwenRealtimeClient:
         self._cancel_task = None
         self._transcript_buffer = ""
         self._sentence_count = 0
+        self._cooldown = False
+        self._cooldown_task = None
 
     def _get_url(self) -> str:
         return WS_URL_TEMPLATE.format(
@@ -227,6 +229,10 @@ class QwenRealtimeClient:
 
         if t == "response.created":
             self._start_cancel_timer()
+            self._cooldown = False
+            if self._cooldown_task:
+                self._cooldown_task.cancel()
+                self._cooldown_task = None
             if self.on_response_start:
                 self.on_response_start()
 
@@ -255,11 +261,16 @@ class QwenRealtimeClient:
                 self.on_ai_text(text)
 
         elif t == "input_audio_buffer.speech_started":
+            if self._cooldown:
+                logger.info("冷却期中，忽略语音输入")
+                return
             self._cancel_timer()
             if self.on_speech_start:
                 self.on_speech_start()
 
         elif t == "input_audio_buffer.speech_stopped":
+            if self._cooldown:
+                return
             if self.on_speech_end:
                 self.on_speech_end()
 
@@ -267,16 +278,43 @@ class QwenRealtimeClient:
             self._cancel_timer()
             if self.on_response_end:
                 self.on_response_end()
+            self._start_cooldown()
 
         elif t == "response.cancelled":
             self._cancel_timer()
             if self.on_response_end:
                 self.on_response_end()
+            self._start_cooldown()
 
         elif t == "error":
             self._cancel_timer()
             msg = event.get("error", {}).get("message", "未知错误")
             self._error(f"服务端错误: {msg}")
+
+    def _start_cooldown(self):
+        """After AI responds, enter cooldown to prevent self-talking loops."""
+        self._cooldown = True
+        if self._cooldown_task:
+            self._cooldown_task.cancel()
+        self._cooldown_task = asyncio.create_task(self._cooldown_timer())
+        # Clear audio buffer to prevent accumulated audio from triggering response
+        asyncio.create_task(self._clear_audio_buffer())
+
+    async def _cooldown_timer(self):
+        try:
+            await asyncio.sleep(3)
+            self._cooldown = False
+            logger.info("冷却期结束，恢复语音输入")
+        except asyncio.CancelledError:
+            pass
+
+    async def _clear_audio_buffer(self):
+        """Clear the input audio buffer to prevent stale audio from triggering responses."""
+        if self._ws and self._running:
+            try:
+                await self._ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+            except Exception:
+                pass
 
     def _status(self, msg: str):
         logger.info(msg)
