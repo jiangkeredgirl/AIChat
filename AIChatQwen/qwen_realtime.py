@@ -154,6 +154,9 @@ class QwenRealtimeClient:
             if self._is_responding:
                 await self.cancel_response()
                 await asyncio.sleep(0.3)
+            # Clear audio buffer first so server doesn't think user is still speaking
+            await self.clear_audio_buffer()
+            await asyncio.sleep(0.2)
             await self._ws.send(json.dumps({
                 "type": "conversation.item.create",
                 "item": {
